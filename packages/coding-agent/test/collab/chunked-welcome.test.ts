@@ -103,6 +103,7 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,
 		streamingMessage: undefined,
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		loadingAnimation: undefined,
 		statusLine: {
@@ -111,7 +112,7 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 			resetActiveTime: () => {},
 		},
 		ui: { requestRender: () => {} },
-		chatContainer: { clear: () => {} },
+		chatContainer: { clear: () => {}, disposeChildren: () => {} },
 		resetObserverRegistry: () => {},
 		renderInitialMessages: () => {},
 		reloadTodos: () => Promise.resolve(),

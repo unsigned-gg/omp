@@ -23,8 +23,7 @@ import type { Settings } from "../capability/settings";
 import { settingsCapability } from "../capability/settings";
 import type { Skill } from "../capability/skill";
 import { skillCapability } from "../capability/skill";
-import type { SlashCommand } from "../capability/slash-command";
-import { slashCommandCapability } from "../capability/slash-command";
+import { type SlashCommand, slashCommandCapability, slashCommandFrontmatterDisplay } from "../capability/slash-command";
 import type { CustomTool } from "../capability/tool";
 import { toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
@@ -87,23 +86,28 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	]);
 
 	const items: MCPServer[] = [];
-	if (userConfig) {
-		const servers = extractMCPServersFromToml(userConfig, path.dirname(userConfigPath));
-		for (const [name, config] of Object.entries(servers)) {
-			items.push({
-				name,
-				...config,
-				_source: createSourceMeta(PROVIDER_ID, userConfigPath, "user"),
-			});
-		}
-	}
+	// Capability dedupe is first-wins, including suppressed items claiming their
+	// key. Load project entries first so a project `enabled = false` keeps a
+	// same-named user server disabled.
 	if (projectConfig) {
 		const servers = extractMCPServersFromToml(projectConfig, path.dirname(projectConfigPath));
-		for (const [name, config] of Object.entries(servers)) {
+		for (const name in servers) {
+			const config = servers[name];
 			items.push({
 				name,
 				...config,
 				_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
+			});
+		}
+	}
+	if (userConfig) {
+		const servers = extractMCPServersFromToml(userConfig, path.dirname(userConfigPath));
+		for (const name in servers) {
+			const config = servers[name];
+			items.push({
+				name,
+				...config,
+				_source: createSourceMeta(PROVIDER_ID, userConfigPath, "user"),
 			});
 		}
 	}
@@ -125,6 +129,7 @@ async function loadTomlConfig(_ctx: LoadContext, path: string): Promise<Record<s
 
 /** Codex MCP server config format (from config.toml) */
 interface CodexMCPConfig {
+	enabled?: boolean;
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
@@ -152,13 +157,20 @@ function extractMCPServersFromToml(
 	const codexServers = toml.mcp_servers as Record<string, CodexMCPConfig>;
 	const result: Record<string, Partial<MCPServer>> = {};
 
-	for (const [name, config] of Object.entries(codexServers)) {
+	for (const name in codexServers) {
+		const config = codexServers[name];
 		// Root relative cwd/command against the Codex config directory. Codex
 		// spawns the process with the resolved cwd, so a relative command is
 		// resolved by the OS from there — pass "cwd" so e.g. cwd="server",
 		// command="./bin/mcp" resolves to <configDir>/server/bin/mcp.
 		const rooted = resolvePluginStdioPaths({ command: config.command, cwd: config.cwd }, configDir, "cwd");
 		const server: Partial<MCPServer> = {
+			// Carry `enabled: false` through rather than dropping the entry: the
+			// central MCP loader (`loadAllMCPConfigs`) suppresses disabled servers
+			// so they still claim their dedupe key (keeping a same-named,
+			// lower-priority source disabled) and remain overridable via the user
+			// force-enable allowlist. Dropping here would defeat both.
+			...(config.enabled === false && { enabled: false }),
 			...(rooted.command !== undefined && { command: rooted.command }),
 			args: config.args,
 			url: config.url,
@@ -283,6 +295,7 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 				name: String(commandName),
 				path,
 				content: body,
+				...slashCommandFrontmatterDisplay(frontmatter),
 				level,
 				_source: source,
 			};

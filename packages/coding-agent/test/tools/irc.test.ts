@@ -32,6 +32,7 @@ function makeFakeSession(): FakeSession {
 	const delivered: IrcMessage[] = [];
 	const relayed: CustomMessage[] = [];
 	const session = {
+		isStreaming: true,
 		deliverIrcMessage: async (msg: IrcMessage) => {
 			if (nextError) {
 				const err = nextError;
@@ -601,7 +602,7 @@ describe("IRC", () => {
 			expect(text).toContain("Peer messaging is unavailable");
 		});
 
-		it("the tool is marked interruptible", () => {
+		it("only marks passive wait operations interruptible", () => {
 			const session: ToolSession = {
 				cwd: "/tmp",
 				hasUI: false,
@@ -612,7 +613,12 @@ describe("IRC", () => {
 				getAgentId: () => "0-Main",
 			};
 			const tool = new HubTool(session);
-			expect(tool.interruptible).toBe(true);
+			if (typeof tool.interruptible !== "function") throw new Error("Hub interruptibility must resolve per call");
+			expect(tool.interruptible({ op: "wait" })).toBe(true);
+			expect(tool.interruptible({ op: "logs", follow: true })).toBe(true);
+			expect(tool.interruptible({ op: "logs" })).toBe(false);
+			expect(tool.interruptible({ op: "start" })).toBe(false);
+			expect(tool.interruptible({ op: "send", await: true })).toBe(false);
 		});
 
 		it("op=list includes parked peers, unread counts, and parent ids", async () => {
@@ -978,7 +984,6 @@ describe("IRC", () => {
 			expect(promptSpy).toHaveBeenCalledTimes(1);
 			// The idle wake routes through #wakeForIrc, which batches records into one prompt —
 			// even a lone incoming message is delivered as a one-element array.
-			expect(promptSpy.mock.calls[0]).toBeDefined();
 			const prompted = (promptSpy.mock.calls[0]![0] as unknown as CustomMessage[])[0];
 			expect(prompted).toMatchObject({ role: "custom", customType: "irc:incoming" });
 			expect(prompted.details).toMatchObject({ id: "msg-1", from: "0-Peer", message: "wake up" });

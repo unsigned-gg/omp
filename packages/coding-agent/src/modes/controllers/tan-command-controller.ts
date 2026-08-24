@@ -75,11 +75,24 @@ export class TanCommandController {
 		const parentPromptCacheKey = session.agent.promptCacheKey ?? parentSessionId;
 		const thinkingLevel = session.configuredThinkingLevel();
 		const systemPrompt = [...session.systemPrompt];
-		const toolNames = session.getActiveToolNames();
+		const toolNames = session.getEnabledToolNames();
 		const modelRegistry = session.modelRegistry;
 		const ownerId = session.getAgentId() ?? MAIN_AGENT_ID;
 		const mcpManager = this.ctx.mcpManager;
 		const cwd = this.ctx.sessionManager.getCwd();
+		const parentArtifactsDir = this.ctx.sessionManager.getArtifactsDir();
+		// Snapshot the parent session's local:// mapping when dispatching. The
+		// interactive SessionManager is mutable and may switch transcripts while
+		// this background tan is still running. Use the session-manager id (not
+		// `session.sessionId`, which can diverge after `/fresh` or a provider
+		// session override) so the tan resolves the same local root the parent's
+		// large-paste writes and `local://` reads use — notably the Windows
+		// short-root fallback keys `%TEMP%/omp-local/<id>` off this id.
+		const parentLocalSessionId = this.ctx.sessionManager.getSessionId();
+		const localProtocolOptions = {
+			getArtifactsDir: () => parentArtifactsDir,
+			getSessionId: () => parentLocalSessionId,
+		};
 		// Nest the clone inside the parent's artifact directory (like a subagent
 		// session) rather than as a top-level sibling, so it shares the parent's
 		// artifacts in place — no copy needed.
@@ -98,6 +111,7 @@ export class TanCommandController {
 		let jobId = "";
 		try {
 			const cloneManager = await SessionManager.forkFrom(parentFile, cwd, sessionDir, undefined, {
+				copyArtifacts: false,
 				suppressBreadcrumb: true,
 				sessionFile: cloneFile,
 			});
@@ -132,12 +146,13 @@ export class TanCommandController {
 							parentAgentId: ownerId,
 							agentRegistry,
 							disableExtensionDiscovery: true,
+							localProtocolOptions,
 						});
 						clone = created.session;
 						clone.sessionManager?.appendSessionInit?.({
 							systemPrompt: clone.systemPrompt ? clone.systemPrompt.join("\n\n") : systemPrompt.join("\n\n"),
 							task: trimmedWork,
-							tools: clone.getActiveToolNames ? clone.getActiveToolNames() : toolNames,
+							tools: clone.getEnabledToolNames(),
 						});
 						const abortClone = () => {
 							void clone?.abort();

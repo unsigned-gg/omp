@@ -55,7 +55,6 @@ function makeCodexModel(): Model<"openai-codex-responses"> {
 describe("YieldTool", () => {
 	it("accepts success payload with data", async () => {
 		const tool = new YieldTool(createSession());
-		expect(tool.strict).toBe(false);
 		const result = await tool.execute("call-1", { result: { data: { ok: true } } } as never);
 		expect(result.details).toEqual({ data: { ok: true }, status: "success", error: undefined });
 	});
@@ -76,6 +75,137 @@ describe("YieldTool", () => {
 			type: "summary",
 			useLastTurn: true,
 		});
+	});
+	it("finalizes type:'result' with the result wrapper omitted entirely as a last-turn yield", async () => {
+		// Gemini-flash traces: the description invites omitting `data`, and weak
+		// callers omit the whole `result` wrapper with it. Must not bounce with
+		// a retryable format error.
+		const tool = new YieldTool(createSession());
+		const result = await tool.execute("call-wrapperless-last-turn", { type: "result" } as never);
+		expect(result.details).toEqual({
+			data: undefined,
+			status: "success",
+			error: undefined,
+			type: "result",
+			useLastTurn: true,
+		});
+	});
+	it("rejects a schema-bound last-turn finalize with no accumulated sections as retryable", async () => {
+		// Instruction-followed punt observed in Gemini traces: `{type:"result"}`
+		// with a declared output schema. Accepting it terminates the child and
+		// finalization then fails post-mortem with an uncorrectable
+		// schema_violation; the tool must bounce it in-band instead.
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					type: "object",
+					properties: { summary: { type: "string" } },
+					required: ["summary"],
+				},
+			}),
+		);
+		await expect(tool.execute("call-schema-punt", { type: "result" } as never)).rejects.toThrow(
+			/structured output matching the declared schema/,
+		);
+	});
+
+	it("accepts a data-less finalize after incremental sections even when schema-bound", async () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					type: "object",
+					properties: { findings: { type: "array", items: { type: "string" } } },
+					required: ["findings"],
+				},
+			}),
+		);
+		const section = await tool.execute("call-section", {
+			type: ["findings"],
+			result: { data: "one finding" },
+		} as never);
+		expect(section.details?.status).toBe("success");
+		const finalize = await tool.execute("call-finalize", { type: "result" } as never);
+		expect(finalize.details).toEqual({
+			data: undefined,
+			status: "success",
+			error: undefined,
+			type: "result",
+			useLastTurn: true,
+		});
+	});
+
+	it("salvages a top-level data payload missing the result wrapper", async () => {
+		const tool = new YieldTool(createSession());
+		const result = await tool.execute("call-unwrapped-data", { data: { ok: true } } as never);
+		expect(result.details).toEqual({ data: { ok: true }, status: "success", error: undefined });
+	});
+
+	it("salvages a top-level error missing the result wrapper", async () => {
+		const tool = new YieldTool(createSession());
+		const result = await tool.execute("call-unwrapped-error", { error: "blocked" } as never);
+		expect(result.details).toEqual({ data: undefined, status: "aborted", error: "blocked" });
+	});
+
+	it("parses a JSON-string result envelope losslessly", async () => {
+		const tool = new YieldTool(createSession());
+		const result = await tool.execute("call-string-envelope", {
+			result: '{"data":{"ok":true}}',
+		} as never);
+		expect(result.details).toEqual({ data: { ok: true }, status: "success", error: undefined });
+	});
+
+	it("parses JSON-string data when the schema rejects the string form", async () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					type: "object",
+					properties: { n: { type: "number" } },
+					required: ["n"],
+				},
+			}),
+		);
+		const result = await tool.execute("call-string-data", { result: { data: '{"n":4}' } } as never);
+		expect(result.details).toEqual({ data: { n: 4 }, status: "success", error: undefined });
+	});
+
+	it("arg validation serializes object payloads for string-typed output fields", () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					type: "object",
+					properties: { summary: { type: "string" } },
+					required: ["summary"],
+				},
+			}),
+		);
+		expect(
+			validateToolArguments(tool as never, {
+				type: "toolCall",
+				id: "call-dict-summary",
+				name: "yield",
+				arguments: { result: { data: { summary: { purge: 13, keep: 20 } } } },
+			}),
+		).toEqual({ result: { data: { summary: '{"purge":13,"keep":20}' } } });
+	});
+
+	it("arg validation passes conforming args through unmodified", () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					type: "object",
+					properties: { summary: { type: "string" } },
+					required: ["summary"],
+				},
+			}),
+		);
+		const args = { result: { data: { summary: "all good" } } };
+		const validated = validateToolArguments(tool as never, {
+			type: "toolCall",
+			id: "call-clean",
+			name: "yield",
+			arguments: args,
+		});
+		expect(validated).toEqual(args);
 	});
 
 	it("passes array-typed success through as an incremental result", async () => {
@@ -539,7 +669,6 @@ describe("YieldTool", () => {
 
 		const abortResult = await tool.execute("call-empty-abort", { result: {} } as never);
 		const details = abortResult.details;
-		expect(details).toBeDefined();
 		if (!details) throw new Error("missing abort details");
 		expect(details.status).toBe("aborted");
 		expect(details.data).toBeUndefined();
@@ -569,7 +698,6 @@ describe("YieldTool", () => {
 
 		const abortResult = await tool.execute("call-empty-after-reset-abort", { result: {} } as never);
 		const details = abortResult.details;
-		expect(details).toBeDefined();
 		if (!details) throw new Error("missing abort details");
 		expect(details.status).toBe("aborted");
 		expect(details.data).toBeUndefined();
@@ -809,6 +937,7 @@ describe("YieldTool", () => {
 				},
 			}),
 		);
+
 		expect(tool.strict).toBe(true);
 
 		const toolDefinition: Tool = {
@@ -817,6 +946,7 @@ describe("YieldTool", () => {
 			parameters: tool.parameters,
 			strict: tool.strict,
 		};
+
 		// One incremental finding (a single element, not the full output) must validate.
 		expect(
 			validateToolArguments(toolDefinition, {
@@ -1106,8 +1236,8 @@ describe("YieldTool", () => {
 		).rejects.toThrow("Output does not match schema");
 	});
 
-	it("rejects nested-array shape mismatches with a retry hint (explore-style JTD)", async () => {
-		// Regression for the GLM/explore failure mode: model invents per-file fields
+	it("rejects nested-array shape mismatches with a retry hint (scout-style JTD)", async () => {
+		// Regression for the GLM/scout failure mode: model invents per-file fields
 		// (`ref`, `surface`, …) instead of the schema's `path` + `description`. The
 		// in-tool validator MUST surface the mismatch with a retry directive so the
 		// subagent can fix its output before the parent runs its post-mortem check.
@@ -1138,13 +1268,13 @@ describe("YieldTool", () => {
 			],
 		};
 
-		await expect(tool.execute("call-explore-1", { result: { data: badPayload } } as never)).rejects.toThrow(
+		await expect(tool.execute("call-scout-1", { result: { data: badPayload } } as never)).rejects.toThrow(
 			/files\/0\/path: is required.*Call yield again with the corrected shape/,
 		);
 
 		// Third retry still throws with one attempt remaining advertised in the hint.
-		await tool.execute("call-explore-2", { result: { data: badPayload } } as never).catch(() => {});
-		await expect(tool.execute("call-explore-3", { result: { data: badPayload } } as never)).rejects.toThrow(
+		await tool.execute("call-scout-2", { result: { data: badPayload } } as never).catch(() => {});
+		await expect(tool.execute("call-scout-3", { result: { data: badPayload } } as never)).rejects.toThrow(
 			"this is the final retry before the schema constraint is dropped",
 		);
 	});
@@ -1180,12 +1310,8 @@ describe("YieldTool", () => {
 	it("rejects submissions without a result object", async () => {
 		const tool = new YieldTool(createSession());
 		await expect(tool.execute("call-3", {} as never)).rejects.toThrow(
-			"result must be an object containing either data or error",
+			'Submit success as {"result":{"data":<your output>}} or failure as {"result":{"error":"message"}}.',
 		);
-	});
-	it("sets lenientArgValidation so agent-loop bypasses validation errors", () => {
-		const tool = new YieldTool(createSession());
-		expect(tool.lenientArgValidation).toBe(true);
 	});
 	it("falls back to loose schema when outputSchema contains unresolved external $ref", async () => {
 		const tool = new YieldTool(

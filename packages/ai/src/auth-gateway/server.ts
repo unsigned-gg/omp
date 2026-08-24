@@ -147,7 +147,11 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.headers !== undefined) opts.headers = { ...(opts.headers ?? {}), ...options.headers };
 	if (options.toolChoice !== undefined) {
 		opts.toolChoice =
-			typeof options.toolChoice === "object" ? { type: "tool", name: options.toolChoice.name } : options.toolChoice;
+			typeof options.toolChoice !== "object"
+				? options.toolChoice
+				: "type" in options.toolChoice
+					? options.toolChoice
+					: { type: "tool", name: options.toolChoice.name };
 	}
 	if (options.reasoning !== undefined) opts.reasoning = options.reasoning;
 	if (options.disableReasoning !== undefined) opts.disableReasoning = options.disableReasoning;
@@ -155,6 +159,7 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	if (options.taskBudget !== undefined) opts.taskBudget = options.taskBudget;
 	if (options.serviceTier !== undefined) opts.serviceTier = options.serviceTier;
 	if (options.cacheRetention !== undefined) opts.cacheRetention = options.cacheRetention;
+	if (options.include !== undefined) opts.include = options.include;
 	// Client-supplied `prompt_cache_key` wins; otherwise derive a stable
 	// key from the model + system + tools so prefix caching engages on
 	// Codex-class backends across turns of the same logical conversation.
@@ -468,7 +473,7 @@ async function handleFormatEndpoint(
 				if (message.stopReason === "aborted") {
 					return route.module.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(errorMessage);
+				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
 				return route.module.formatError(classified.status, classified.type, errorMessage);
 			}
 			return json(
@@ -651,7 +656,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 				if (message.stopReason === "aborted") {
 					return piNative.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(errorMessage);
+				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
 				return piNative.formatError(classified.status, classified.type, errorMessage);
 			}
 			return json(200, { message }, gatewayResponseHeaders(model, { requestId, message, startedAt }));
@@ -725,14 +730,46 @@ async function handleCredentialsCheck(storage: AuthStorage, signal: AbortSignal)
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
+/**
+ * Row shape for `GET /v1/models`. Beyond the OpenAI-standard `id`/`object`/
+ * `owned_by`, rows advertise the catalog metadata OpenAI-compatible clients
+ * (omp's own proxy discovery, Zed's openai_compatible provider, ...) read to
+ * size and capability-gate discovered models: `context_length`,
+ * `max_output_tokens`, `input_modalities`, and `supports_tools` (only emitted
+ * when the catalog explicitly reports `false`; absent means usable).
+ */
+interface ModelListRow {
+	id: string;
+	object: "model";
+	owned_by: string;
+	api: Api;
+	display_name: string;
+	context_length?: number;
+	max_output_tokens?: number;
+	input_modalities: ("text" | "image")[];
+	supports_tools?: boolean;
+}
+
 function handleModelsList(opts: AuthGatewayBootOptions): Response {
-	const list = opts.listModels ? Array.from(opts.listModels()) : [];
-	const data = list.map(model => ({
-		id: model.id,
-		object: "model" as const,
-		owned_by: model.provider,
-		api: model.api,
-	}));
+	const seen = new Set<string>();
+	const data: ModelListRow[] = [];
+	for (const model of opts.listModels?.() ?? []) {
+		const id = `${model.provider}/${model.id}`;
+		if (seen.has(id)) continue;
+		seen.add(id);
+		const row: ModelListRow = {
+			id,
+			object: "model",
+			owned_by: model.provider,
+			api: model.api,
+			display_name: model.name,
+			input_modalities: model.input,
+		};
+		if (model.contextWindow != null) row.context_length = model.contextWindow;
+		if (model.maxTokens != null) row.max_output_tokens = model.maxTokens;
+		if (model.supportsTools === false) row.supports_tools = false;
+		data.push(row);
+	}
 	return json(200, { object: "list", data });
 }
 

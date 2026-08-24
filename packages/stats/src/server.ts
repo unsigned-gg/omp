@@ -8,8 +8,10 @@ import {
 	getBehaviorDashboardStats,
 	getCostDashboardStats,
 	getDashboardStats,
+	getFolderStats,
 	getModelDashboardStats,
 	getOverviewStats,
+	getProviderDashboardStats,
 	getRecentErrors,
 	getRecentRequests,
 	getRequestDetails,
@@ -20,6 +22,14 @@ import {
 import { decodeEmbeddedClientArchive } from "./embedded-client";
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 import { getGainDashboardStats } from "./gain-aggregator";
+import {
+	prepareStatsPort,
+	recoverStatsPort,
+	STATS_DASHBOARD_HEADER,
+	STATS_DASHBOARD_HOSTNAME,
+	STATS_DASHBOARD_HOSTNAME_HEADER,
+	STATS_DASHBOARD_SECURITY_VERSION,
+} from "./port-conflict";
 
 const EMBEDDED_CLIENT_ARCHIVE = decodeEmbeddedClientArchive(embeddedClientArchiveTxt);
 
@@ -221,6 +231,11 @@ export async function handleApi(req: Request): Promise<Response> {
 		return Response.json(stats);
 	}
 
+	if (path === "/api/stats/providers") {
+		const stats = await getProviderDashboardStats(range);
+		return Response.json(stats);
+	}
+
 	if (path === "/api/stats/recent") {
 		const limit = url.searchParams.get("limit");
 		const stats = await getRecentRequests(limit ? parseInt(limit, 10) : undefined);
@@ -239,8 +254,8 @@ export async function handleApi(req: Request): Promise<Response> {
 	}
 
 	if (path === "/api/stats/folders") {
-		const stats = await getDashboardStats(range);
-		return Response.json(stats.byFolder);
+		const stats = await getFolderStats(range);
+		return Response.json(stats);
 	}
 
 	if (path === "/api/stats/timeseries") {
@@ -293,27 +308,29 @@ async function handleStatic(requestPath: string): Promise<Response> {
 	return new Response("Not Found", { status: 404 });
 }
 
-/**
- * Start the HTTP server.
- */
-export async function startServer(port = 3847): Promise<{ port: number; stop: () => void }> {
-	await ensureClientBuild();
+/** Format a dashboard origin, including brackets required by IPv6 literals. */
+export function formatStatsDashboardUrl(hostname: string, port: number): string {
+	const urlHostname = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
+	return `http://${urlHostname}:${port}`;
+}
 
+function createDashboardServer(port: number, hostname: string) {
 	const server = Bun.serve({
 		port,
+		hostname,
 		async fetch(req) {
 			const url = new URL(req.url);
 			const path = url.pathname;
 
-			// CORS headers for local development
-			const corsHeaders = {
-				"Access-Control-Allow-Origin": "*",
-				"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-				"Access-Control-Allow-Headers": "Content-Type",
+			// The identity header lets another omp session's reuse probe positively
+			// recognize this dashboard without allowing cross-origin API reads.
+			const dashboardHeaders: Record<string, string> = {
+				[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
+				[STATS_DASHBOARD_HOSTNAME_HEADER]: hostname,
 			};
 
 			if (req.method === "OPTIONS") {
-				return new Response(null, { headers: corsHeaders });
+				return new Response(null, { headers: dashboardHeaders });
 			}
 
 			try {
@@ -325,10 +342,10 @@ export async function startServer(port = 3847): Promise<{ port: number; stop: ()
 					response = await handleStatic(path);
 				}
 
-				// Add CORS headers to all responses
+				// Add the dashboard identity header to all responses.
 				const headers = new Headers(response.headers);
-				for (const [key, value] of Object.entries(corsHeaders)) {
-					headers.set(key, value);
+				for (const key in dashboardHeaders) {
+					headers.set(key, dashboardHeaders[key]);
 				}
 
 				return new Response(response.body, {
@@ -339,14 +356,53 @@ export async function startServer(port = 3847): Promise<{ port: number; stop: ()
 				console.error("Server error:", error);
 				return Response.json(
 					{ error: error instanceof Error ? error.message : "Unknown error" },
-					{ status: 500, headers: corsHeaders },
+					{ status: 500, headers: dashboardHeaders },
 				);
 			}
 		},
 	});
+	return server;
+}
 
-	return {
-		port: server.port ?? port,
-		stop: () => server.stop(),
-	};
+/**
+ * Start the HTTP server, reusing a live dashboard or reclaiming a stale omp listener.
+ */
+export async function startServer(
+	port = 3847,
+	hostname = STATS_DASHBOARD_HOSTNAME,
+): Promise<{ hostname: string; port: number; stop: () => void }> {
+	await ensureClientBuild();
+	const preparation = await prepareStatsPort(port, hostname);
+	if (preparation === "reuse") {
+		return { hostname, port, stop: () => {} };
+	}
+
+	try {
+		const server = createDashboardServer(port, hostname);
+		return {
+			hostname,
+			port: server.port ?? port,
+			stop: () => server.stop(),
+		};
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "EADDRINUSE")) throw error;
+
+		const recovery = await recoverStatsPort(port, hostname);
+		if (recovery === "reuse") {
+			return { hostname, port, stop: () => {} };
+		}
+
+		try {
+			const server = createDashboardServer(port, hostname);
+			return {
+				hostname,
+				port: server.port ?? port,
+				stop: () => server.stop(),
+			};
+		} catch (retryError) {
+			throw new Error(`Failed to start stats dashboard on ${hostname}:${port} after reclaiming it.`, {
+				cause: retryError,
+			});
+		}
+	}
 }

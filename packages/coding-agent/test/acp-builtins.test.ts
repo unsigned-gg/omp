@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type {
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
@@ -38,6 +39,7 @@ interface FakeAcpBuiltinSession {
 	model: { provider: string; id: string } | undefined;
 	newSession(opts?: { drop?: boolean; parentSession?: string }): Promise<boolean>;
 	switchSession(sessionPath: string): Promise<boolean>;
+	moveSession(newCwd: string, targetSessionDir?: string): Promise<void>;
 	markMovedFromEmptySessionFile(sessionFile: string): void;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
@@ -120,6 +122,10 @@ function createRuntime() {
 			await fakeSessionManager.flush();
 			await fakeSessionManager.setSessionFile(this._switchedTo);
 			return true;
+		},
+		async moveSession(newCwd: string, _targetSessionDir?: string) {
+			if (!fakeSessionManager) throw new Error("fake session manager not initialized");
+			await fakeSessionManager.moveTo(newCwd);
 		},
 		markMovedFromEmptySessionFile(sessionFile: string) {
 			this._movedFromEmptySessionFile = path.resolve(sessionFile);
@@ -237,6 +243,24 @@ describe("ACP builtin slash commands", () => {
 		expect(output).toEqual(["Fast mode is off."]);
 	});
 
+	it("toggles extended context with explicit controls and reports state", async () => {
+		const { output, runtime } = createRuntime();
+
+		expect(await executeAcpBuiltinSlashCommand("/extended-context off", runtime)).toEqual({ consumed: true });
+		expect(runtime.settings.get("extendedContext")).toBe(false);
+		expect(await executeAcpBuiltinSlashCommand("/extended-context on", runtime)).toEqual({ consumed: true });
+		expect(runtime.settings.get("extendedContext")).toBe(true);
+		expect(await executeAcpBuiltinSlashCommand("/extended-context", runtime)).toEqual({ consumed: true });
+		expect(runtime.settings.get("extendedContext")).toBe(false);
+		expect(await executeAcpBuiltinSlashCommand("/extended-context status", runtime)).toEqual({ consumed: true });
+		expect(output).toEqual([
+			"Extended context disabled.",
+			"Extended context enabled.",
+			"Extended context disabled.",
+			"Extended context is off.",
+		]);
+	});
+
 	it("forces a tool and returns remaining prompt text", async () => {
 		const { output, runtime } = createRuntime();
 
@@ -273,6 +297,40 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("5 hours (prolite)");
 		expect(output[0]).toContain("user@example.com: 0.24 unknown used (76.0% left)");
 		expect(output[0]).toContain("resets in");
+	});
+
+	it("suppresses redundant usage window suffixes while retaining legitimate ones", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.fetchUsageReports = async () => [
+			{
+				provider: "anthropic",
+				fetchedAt: Date.now(),
+				limits: [
+					{
+						id: "anthropic:extra",
+						label: "Claude Extra Usage",
+						scope: { provider: "anthropic", windowId: "extra" },
+						amount: { used: 123.45, unit: "usd" },
+					},
+					{
+						id: "anthropic:daily",
+						label: "Daily quota",
+						scope: { provider: "anthropic", windowId: "24h" },
+						window: { id: "24h", label: "24 hours" },
+						amount: { used: 20, unit: "requests" },
+					},
+				],
+				metadata: { email: "user@example.com" },
+			},
+		];
+
+		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Claude Extra Usage");
+		expect(output[0]).not.toContain("Claude Extra Usage — extra");
+		expect(output[0]).toContain("123.45 usd used");
+		expect(output[0]).toContain("Daily quota — 24 hours");
 	});
 	it("/usage show renders the same report as plain /usage", async () => {
 		const now = 1_700_000_000_000;
@@ -493,7 +551,6 @@ describe("ACP builtin slash commands", () => {
 			"/btw hi",
 			"/new",
 			"/drop",
-			"/handoff",
 			"/fork",
 		];
 		for (const cmd of removedCommands) {
@@ -722,6 +779,13 @@ describe("wave 3 commands", () => {
 		expect(output[0]).toContain("TUI editor");
 	});
 
+	it("/todo expand: returns HUD-only usage message in ACP mode", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/todo expand", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("interactive HUD");
+	});
+
 	it("/todo unknown: returns usage message", async () => {
 		const { output, runtime } = createRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/todo foobar", runtime);
@@ -777,6 +841,28 @@ describe("wave 3 commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/memory unknownverb", runtime);
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("Usage: /memory");
+	});
+
+	it("/memory stats: tells the user memory is off instead of naming a nonexistent 'off backend'", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/memory stats", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("Memory backend is off — there is nothing to show.");
+	});
+
+	it("/memory diagnose: tells the user memory is off instead of naming a nonexistent 'off backend'", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/memory diagnose", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("Memory backend is off — there is nothing to show.");
+	});
+
+	it("/memory stats: still names the backend when a real backend simply has no stats hook", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.settings.set("memory.backend" as never, "local" as never);
+		const result = await executeAcpBuiltinSlashCommand("/memory stats", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("Memory stats is not available for the local backend.");
 	});
 
 	// /todo start fuzzy match
@@ -1024,8 +1110,7 @@ describe("wave 5 — adapters and polish", () => {
 			// Without this assertion, the command could succeed via a side-effect-free
 			// path that prints the success message without writing the host config.
 			expect(spy).toHaveBeenCalledTimes(1);
-			const [configPath, name, hostConfig] = spy.mock.calls[0]!;
-			expect(typeof configPath).toBe("string");
+			const [, name, hostConfig] = spy.mock.calls[0]!;
 			expect(name).toBe("foo");
 			expect(hostConfig).toMatchObject({ host: "x", username: "y" });
 		} finally {
@@ -1089,7 +1174,7 @@ describe("wave 5 — adapters and polish", () => {
 			contextWindow: 200_000,
 		};
 		(session as unknown as Record<string, unknown>).skills = [];
-		(session as unknown as Record<string, unknown>).agent = { state: { tools: [] } };
+		(session as unknown as Record<string, unknown>).agent = { state: { tools: [] }, tokenizer: new Tokenizer() };
 		(session as unknown as Record<string, unknown>).systemPrompt = ["You are a helpful assistant."];
 		session.messages = [
 			{ role: "user", content: "Hello, how are you?" },

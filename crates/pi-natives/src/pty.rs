@@ -13,6 +13,7 @@ use std::{
 };
 
 use napi::{
+	JsString,
 	bindgen_prelude::*,
 	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
@@ -20,7 +21,7 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 
-use crate::{ps, task};
+use crate::{js::into_string, ps, task};
 
 /// Options for running a command in a PTY session.
 #[napi(object)]
@@ -106,6 +107,12 @@ const CONTROL_MESSAGES_PER_TICK: usize = 64;
 const READER_EVENTS_PER_TICK: usize = 256;
 const POST_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long a cancelled run polls for its SIGKILL'd child before handing the
+/// reap off to a detached thread rather than blocking the PTY promise.
+#[cfg(not(windows))]
+const CANCEL_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(not(windows))]
+const CANCEL_REAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(not(windows))]
 const FINAL_READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -132,7 +139,8 @@ impl PtySession {
 		Self { core: Arc::new(Mutex::new(None)) }
 	}
 
-	/// Start a shell command and stream output chunks via callback.
+	/// Start a shell command, stream output chunks, and report the spawned child
+	/// PID.
 	#[napi]
 	pub fn start<'env>(
 		&self,
@@ -140,6 +148,8 @@ impl PtySession {
 		options: PtyStartOptions<'env>,
 		#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
 		on_chunk: Option<ThreadsafeFunction<String>>,
+		#[napi(ts_arg_type = "((error: Error | null, pid: number) => void) | undefined | null")]
+		on_start: Option<ThreadsafeFunction<u32>>,
 	) -> Result<PromiseRaw<'env, PtyRunResult>> {
 		let run_config = PtyRunConfig {
 			command: PtyCommand::Shell { command: options.command, shell: options.shell },
@@ -148,11 +158,11 @@ impl PtySession {
 			cols:    options.cols.unwrap_or(120).clamp(20, 400),
 			rows:    options.rows.unwrap_or(40).clamp(5, 200),
 		};
-		self.start_config(env, run_config, options.timeout_ms, options.signal, on_chunk)
+		self.start_config(env, run_config, options.timeout_ms, options.signal, on_chunk, on_start)
 	}
 
-	/// Start an executable with separate arguments and stream output chunks via
-	/// callback.
+	/// Start an executable with separate arguments, stream output chunks, and
+	/// report the spawned child PID.
 	#[napi]
 	pub fn start_argv<'env>(
 		&self,
@@ -160,6 +170,8 @@ impl PtySession {
 		options: PtyArgvStartOptions<'env>,
 		#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
 		on_chunk: Option<ThreadsafeFunction<String>>,
+		#[napi(ts_arg_type = "((error: Error | null, pid: number) => void) | undefined | null")]
+		on_start: Option<ThreadsafeFunction<u32>>,
 	) -> Result<PromiseRaw<'env, PtyRunResult>> {
 		let run_config = PtyRunConfig {
 			command: PtyCommand::Argv { application: options.application, args: options.args },
@@ -168,13 +180,13 @@ impl PtySession {
 			cols:    options.cols.unwrap_or(120).clamp(20, 400),
 			rows:    options.rows.unwrap_or(40).clamp(5, 200),
 		};
-		self.start_config(env, run_config, options.timeout_ms, options.signal, on_chunk)
+		self.start_config(env, run_config, options.timeout_ms, options.signal, on_chunk, on_start)
 	}
 
 	/// Write raw input bytes to PTY stdin.
 	#[napi]
-	pub fn write(&self, data: String) -> Result<()> {
-		self.send_control(ControlMessage::Input(data))
+	pub fn write(&self, data: JsString) -> Result<()> {
+		self.send_control(ControlMessage::Input(into_string(data)?))
 	}
 
 	/// Resize the active PTY.
@@ -201,6 +213,7 @@ impl PtySession {
 		timeout_ms: Option<u32>,
 		signal: Option<Unknown<'env>>,
 		on_chunk: Option<ThreadsafeFunction<String>>,
+		on_start: Option<ThreadsafeFunction<u32>>,
 	) -> Result<PromiseRaw<'env, PtyRunResult>> {
 		let ct = task::CancelToken::new(timeout_ms, signal);
 		let core = Arc::clone(&self.core);
@@ -215,9 +228,10 @@ impl PtySession {
 			*guard = Some(PtySessionCore { control_tx });
 		}
 		task::future(env, "pty.start", async move {
-			let run_result =
-				tokio::task::spawn_blocking(move || run_pty_sync(run_config, on_chunk, control_rx, ct))
-					.await;
+			let run_result = tokio::task::spawn_blocking(move || {
+				run_pty_sync(run_config, on_chunk, on_start, control_rx, ct)
+			})
+			.await;
 
 			let mut guard = core.lock();
 			*guard = None;
@@ -262,6 +276,7 @@ fn terminate_pty_processes(
 fn run_pty_sync(
 	config: PtyRunConfig,
 	on_chunk: Option<ThreadsafeFunction<String>>,
+	on_start: Option<ThreadsafeFunction<u32>>,
 	control_rx: flume::Receiver<ControlMessage>,
 	ct: task::CancelToken,
 ) -> Result<PtyRunResult> {
@@ -343,8 +358,19 @@ fn run_pty_sync(
 		.spawn_command(cmd)
 		.map_err(|err| Error::from_reason(format!("Failed to spawn PTY command: {err}")))?;
 	drop(pair.slave);
-	ct.heartbeat()
-		.map_err(|err| Error::from_reason(format!("PTY setup cancelled before reader: {err}")))?;
+	let child_process_id = child.process_id();
+	let child_pid = child_process_id.and_then(|value| i32::try_from(value).ok());
+	if let Some(callback) = on_start.as_ref() {
+		callback.call(Ok(child_process_id.unwrap_or(0)), ThreadsafeFunctionCallMode::NonBlocking);
+	}
+	// No heartbeat check here: `child` now owns a real, already-`exec`'d OS
+	// process, and bailing out via `?` at this point would drop `pair`
+	// (closing the pty master) without ever killing or reaping it — the
+	// master hangup delivers SIGHUP to the child (it's the pty's session
+	// leader), which kills it almost immediately, but nothing calls
+	// wait()/try_wait() afterward, so it leaks as a permanent zombie. A
+	// cancellation here is instead picked up on the main loop's first
+	// iteration below, which already kills and reaps correctly.
 
 	let master = pair.master;
 	let mut writer = master
@@ -423,9 +449,6 @@ fn run_pty_sync(
 		let _ = reader_tx.send(ReaderEvent::Done);
 	});
 
-	let child_pid = child
-		.process_id()
-		.and_then(|value| i32::try_from(value).ok());
 	#[cfg(unix)]
 	let process_group_id = master.process_group_leader().filter(|pgid| *pgid > 0);
 	#[cfg(not(unix))]
@@ -517,37 +540,56 @@ fn run_pty_sync(
 		}
 	}
 	if exit_code.is_none() {
+		// `std::process::Child` (what `portable-pty` wraps on Unix) never waits on
+		// `Drop`, so a child left unwaited here leaks as a permanent zombie.
+		//
+		// On Windows, child.wait() can hang indefinitely in ConPTY.
+		// Poll try_wait() with a short timeout instead.
+		#[cfg(windows)]
+		if !terminate_requested {
+			let wait_start = Instant::now();
+			while exit_code.is_none() && wait_start.elapsed() < Duration::from_secs(5) {
+				if let Some(status) = child
+					.try_wait()
+					.map_err(|err| Error::from_reason(format!("Failed checking PTY status: {err}")))?
+				{
+					exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(50));
+			}
+		}
+		#[cfg(not(windows))]
 		if terminate_requested {
-			if let Some(status) = child
-				.try_wait()
-				.map_err(|err| Error::from_reason(format!("Failed checking PTY status: {err}")))?
-			{
-				exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
+			// SIGKILL does not guarantee a prompt exit — a child wedged in
+			// uninterruptible I/O never reaps, and a kill that failed leaves it
+			// running — so blocking here would pin this `spawn_blocking` worker
+			// and the promise well past the caller's deadline. Poll briefly, then
+			// hand the reap to a detached thread so cancellation still returns.
+			let deadline = Instant::now() + CANCEL_REAP_TIMEOUT;
+			while exit_code.is_none() {
+				if let Some(status) = child
+					.try_wait()
+					.map_err(|err| Error::from_reason(format!("Failed checking PTY status: {err}")))?
+				{
+					exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
+					break;
+				}
+				if Instant::now() >= deadline {
+					break;
+				}
+				std::thread::sleep(CANCEL_REAP_POLL_INTERVAL);
+			}
+			if exit_code.is_none() {
+				std::thread::spawn(move || {
+					let _ = child.wait();
+				});
 			}
 		} else {
-			// On Windows, child.wait() can hang indefinitely in ConPTY.
-			// Poll try_wait() with a short timeout instead.
-			#[cfg(windows)]
-			{
-				let wait_start = Instant::now();
-				while exit_code.is_none() && wait_start.elapsed() < Duration::from_secs(5) {
-					if let Some(status) = child
-						.try_wait()
-						.map_err(|err| Error::from_reason(format!("Failed checking PTY status: {err}")))?
-					{
-						exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
-						break;
-					}
-					std::thread::sleep(Duration::from_millis(50));
-				}
-			}
-			#[cfg(not(windows))]
-			{
-				let status = child
-					.wait()
-					.map_err(|err| Error::from_reason(format!("Failed waiting PTY process: {err}")))?;
-				exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
-			}
+			let status = child
+				.wait()
+				.map_err(|err| Error::from_reason(format!("Failed waiting PTY process: {err}")))?;
+			exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
 		}
 	}
 	// --- Teardown ---
@@ -619,5 +661,136 @@ fn run_pty_sync(
 fn emit_chunk(text: &str, callback: Option<&ThreadsafeFunction<String>>) {
 	if let Some(callback) = callback {
 		callback.call(Ok(text.to_string()), ThreadsafeFunctionCallMode::NonBlocking);
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod zombie_repro_tests {
+	//! Reproduces the leaked-zombie race fixed above: a PTY session cancelled
+	//! (timed out) shortly after spawn used to abandon its child unreaped, and
+	//! `std::process::Child` never waits on `Drop`, so the process stuck around
+	//! as a permanent zombie.
+	//!
+	//! `#[ignore]`d: it saturates every core to provoke the scheduler races, so
+	//! it must run alone. `cargo nextest run --run-ignored ignored-only
+	//! --test-threads=1 -E 'test(zombie_repro_tests)'`
+
+	use std::{
+		collections::HashSet,
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		},
+		thread,
+	};
+
+	use super::*;
+
+	const STORM_CHILD_COMM: &str = "sleep";
+
+	/// Zombie PIDs parented to this test process and spawned as
+	/// `STORM_CHILD_COMM`. The comm filter keeps a sibling test's
+	/// exited-before-wait child from counting as a leak here.
+	fn zombie_child_pids() -> HashSet<u32> {
+		let my_pid = std::process::id();
+		let mut pids = HashSet::new();
+		let Ok(entries) = std::fs::read_dir("/proc") else {
+			return pids;
+		};
+		for entry in entries.flatten() {
+			let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+				continue;
+			};
+			let Ok(pid) = name.parse::<u32>() else {
+				continue;
+			};
+			let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+				continue;
+			};
+			// `/proc/[pid]/stat` is `pid (comm) state ppid ...`; comm can itself
+			// contain spaces and parens, so bound it by the first `(` and last `)`.
+			let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+				continue;
+			};
+			if stat.get(open + 1..close) != Some(STORM_CHILD_COMM) {
+				continue;
+			}
+			let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+			let (Some(state), Some(ppid)) = (fields.first(), fields.get(1)) else {
+				continue;
+			};
+			if *state == "Z" && ppid.parse::<u32>() == Ok(my_pid) {
+				pids.insert(pid);
+			}
+		}
+		pids
+	}
+
+	struct StormOutcome {
+		leaked:  usize,
+		spawned: usize,
+	}
+
+	/// Run `iterations` PTY sessions cancelled ~1ms after spawn while every core
+	/// is kept contended.
+	fn run_cancel_storm(iterations: usize) -> StormOutcome {
+		let before = zombie_child_pids();
+
+		let stop = Arc::new(AtomicBool::new(false));
+		let busy: Vec<_> = (0..thread::available_parallelism().map_or(8, |n| n.get()))
+			.map(|_| {
+				let stop = Arc::clone(&stop);
+				thread::spawn(move || {
+					while !stop.load(Ordering::Relaxed) {
+						std::hint::spin_loop();
+					}
+				})
+			})
+			.collect();
+
+		let mut spawned = 0;
+		for _ in 0..iterations {
+			let (_tx, rx) = flume::unbounded();
+			let ct = task::CancelToken::new(Some(1), None);
+			let config = PtyRunConfig {
+				command: PtyCommand::Argv {
+					application: STORM_CHILD_COMM.to_string(),
+					args:        vec!["5".to_string()],
+				},
+				cwd:     None,
+				env:     None,
+				cols:    80,
+				rows:    24,
+			};
+			// Pre-spawn heartbeats bail with `Err`, so `Ok` means this iteration
+			// reached the post-spawn cancellation path.
+			if run_pty_sync(config, None, None, rx, ct).is_ok() {
+				spawned += 1;
+			}
+		}
+
+		stop.store(true, Ordering::Relaxed);
+		for handle in busy {
+			let _ = handle.join();
+		}
+		// Let a slow reap land so only truly abandoned processes are counted.
+		thread::sleep(Duration::from_millis(200));
+		let leaked = zombie_child_pids().difference(&before).count();
+		StormOutcome { leaked, spawned }
+	}
+
+	#[test]
+	#[ignore]
+	fn cancelled_pty_sessions_do_not_leak_zombies() {
+		const ITERATIONS: usize = 60;
+		let StormOutcome { leaked, spawned } = run_cancel_storm(ITERATIONS);
+		assert_eq!(leaked, 0, "cancelled PTY sessions leaked {leaked} zombie process(es)");
+		// Checked second so a real leak reports as one: a clean run only proves
+		// something if children were actually spawned to begin with.
+		assert!(
+			spawned >= ITERATIONS / 3,
+			"only {spawned}/{ITERATIONS} iterations reached the post-spawn cancellation path; the \
+			 storm is not exercising the reap"
+		);
 	}
 }

@@ -14,7 +14,7 @@ import type {
 import { streamSimple } from "@oh-my-pi/pi-ai";
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, getProjectDir } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -555,6 +555,7 @@ async function resolveDryBalanceModel(
 		const resolved = resolveCliModel({
 			cliModel: modelSelector,
 			modelRegistry,
+			settings,
 			preferences,
 		});
 		if (resolved.error) throw new Error(resolved.error);

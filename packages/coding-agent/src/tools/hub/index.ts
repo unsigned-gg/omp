@@ -15,6 +15,7 @@
  * when the agent has nothing else to do.
  */
 
+import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -25,13 +26,13 @@ import type {
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { IrcBus } from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
 import hubDescription from "../../prompts/tools/hub.md" with { type: "text" };
 import type { AgentRegistry } from "../../registry/agent-registry";
 import type { ToolSession } from "..";
+import type { ToolActivitySummary } from "../renderers";
 import {
 	buildJobResult,
 	executeCancel,
@@ -159,7 +160,10 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 	readonly description: string;
 	readonly parameters = hubSchema;
 	readonly strict = true;
-	readonly interruptible = true;
+	readonly interruptible = (params: Partial<HubParams>): boolean => {
+		if (params.op === "wait") return true;
+		return params.op === "logs" && params.follow === true;
+	};
 	readonly loadMode = "essential";
 
 	readonly examples: readonly ToolExample<typeof hubSchema.infer>[] = [
@@ -280,7 +284,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 				if (!params.ids?.length) {
 					return hubErrorResult('`ids` is required for op="cancel".', { op: "cancel", jobs: [] });
 				}
-				return executeCancel(this.session, manager, this.#ownerId(), params.ids);
+				return await executeCancel(this.session, manager, this.#ownerId(), params.ids);
 			}
 			case "jobs": {
 				const manager = this.session.asyncJobManager;
@@ -368,13 +372,21 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		if (!manager || runningJobs.length === 0) {
 			// No job legs: pure message wait — or nothing to block on at all.
 			if (!messaging) return nothingToWaitForResult(this.session);
+			// The bus mailbox is a separate store from the session-pending buffer
+			// drained above, and only `executeMessageWait` below ever reads it. A
+			// peer that sends and then stops running leaves its message queued
+			// there, so without this take the liveness gate would answer "nothing
+			// to wait for" while `hub inbox` hands back the very message being
+			// waited on. Single atomic take: the rest of the backlog stays queued.
+			const queued = IrcBus.global().take(messaging.senderId, from);
+			if (queued) return messageResult(messaging.senderId, queued);
 			if (!from) {
 				// A bare wait can only be satisfied by a running peer eventually
 				// sending something; with none, return the snapshot immediately
 				// instead of blocking a full message-timeout window.
 				const hasRunningPeer = messaging.registry
 					.listVisibleTo(messaging.senderId)
-					.some(ref => ref.status === "running");
+					.some(ref => messaging.registry.isRunning(ref));
 				if (!hasRunningPeer) return nothingToWaitForResult(this.session);
 			}
 			return executeMessageWait(messaging, { from, timeoutMs: params.timeoutMs }, signal);
@@ -534,6 +546,19 @@ function toLaunchArgs(args: HubRenderArgs | undefined): LaunchRenderArgs {
 export const hubToolRenderer = {
 	inline: true,
 	mergeCallAndResult: true,
+	/** Compact one-line activity: op plus its peer, process, or job target. */
+	activitySummary(args: unknown): ToolActivitySummary {
+		const hubArgs = (args ?? {}) as HubRenderArgs;
+		const op = hubArgs.op;
+		if (!op) return { label: "Hub" };
+		let detail = op;
+		if (op === "send" && (hubArgs.to || hubArgs.name)) detail = `send → ${hubArgs.to ?? hubArgs.name}`;
+		else if (op === "wait" && (hubArgs.from || hubArgs.name)) detail = `wait ${hubArgs.from ?? hubArgs.name}`;
+		else if ((op === "wait" || op === "cancel") && hubArgs.ids?.length) {
+			detail = `${op} ${hubArgs.ids.length} job${hubArgs.ids.length === 1 ? "" : "s"}`;
+		} else if (hubArgs.name) detail = `${op} ${hubArgs.name}`;
+		return { label: "Hub", detail };
+	},
 	// Only launch pending frames consume the spinner (broker RPC in flight);
 	// messaging/job pending frames are static, exactly as before the merge.
 	animatedPendingPreview: (args: unknown): boolean => isLaunchStyleArgs(args as HubRenderArgs | undefined),

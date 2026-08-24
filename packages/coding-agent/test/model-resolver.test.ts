@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	expandRoleAlias,
@@ -9,10 +10,13 @@ import {
 	parseModelPattern,
 	parseModelString,
 	pickDefaultAvailableModel,
+	resolveAgentAdvisorSelection,
 	resolveAgentModelPatterns,
+	resolveAgentModelSelection,
 	resolveAgentPrewalkPattern,
 	resolveAllowedModels,
 	resolveCliModel,
+	resolveExplicitModelRole,
 	resolveModelFromString,
 	resolveModelOverride,
 	resolveModelRoleValue,
@@ -434,6 +438,17 @@ describe("pickDefaultAvailableModel", () => {
 		expect(result?.provider).toBe("zhipu-coding-plan");
 		expect(result?.id).toBe("glm-5.1");
 	});
+
+	test("prefers SuperGrok over paid xAI when both defaults are present", () => {
+		const paid = getBundledModel("xai", DEFAULT_MODEL_PER_PROVIDER.xai);
+		const oauth = getBundledModel("xai-oauth", DEFAULT_MODEL_PER_PROVIDER["xai-oauth"]);
+		if (!paid || !oauth) {
+			throw new Error("Expected bundled xAI provider defaults");
+		}
+
+		expect(pickDefaultAvailableModel([paid, oauth])?.provider).toBe("xai-oauth");
+		expect(pickDefaultAvailableModel([paid])?.provider).toBe("xai");
+	});
 });
 
 describe("parseModelPattern", () => {
@@ -662,6 +677,76 @@ describe("parseModelPattern", () => {
 		});
 	});
 
+	describe("provider-qualified selectors vs aggregator raw-id shadowing", () => {
+		const anthropicOpus5 = createOpusModel("anthropic", "claude-opus-5", "Claude Opus 5");
+		const openRouterOpus5 = buildModel({
+			id: "anthropic/claude-opus-5",
+			name: "Claude Opus 5 (OpenRouter)",
+			api: "anthropic-messages",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			thinking: {
+				mode: "budget",
+				efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+			},
+			input: ["text", "image"],
+			cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+			contextWindow: 200000,
+			maxTokens: 32000,
+		});
+
+		test("anthropic/claude-opus-5 does not shadow onto the OpenRouter flat id when anthropic is unavailable", () => {
+			// Anthropic carries claude-opus-5 in the bundled catalog but is absent from
+			// the candidate set (disabled provider, missing creds at boot): the selector
+			// is provider-qualified and must fail rather than re-bind to OpenRouter.
+			const result = parseModelPattern("anthropic/claude-opus-5", [openRouterOpus5]);
+			expect(result.model).toBeUndefined();
+		});
+
+		test("the provider lock is case-insensitive (Anthropic/Claude-Opus-5 still fails closed)", () => {
+			// The matcher compares ids case-insensitively, so the lock must too —
+			// otherwise case variance silently re-enables the aggregator shadow.
+			const result = parseModelPattern("Anthropic/Claude-Opus-5", [openRouterOpus5]);
+			expect(result.model).toBeUndefined();
+		});
+
+		test("anthropic/claude-opus-5 resolves to the anthropic provider when it is available", () => {
+			const result = parseModelPattern("anthropic/claude-opus-5", [anthropicOpus5, openRouterOpus5]);
+			expect(result.model?.provider).toBe("anthropic");
+			expect(result.model?.id).toBe("claude-opus-5");
+		});
+
+		test("explicit openrouter/anthropic/claude-opus-5 still selects the OpenRouter model", () => {
+			const result = parseModelPattern("openrouter/anthropic/claude-opus-5", [openRouterOpus5]);
+			expect(result.model?.provider).toBe("openrouter");
+			expect(result.model?.id).toBe("anthropic/claude-opus-5");
+		});
+
+		test("resolveModelFromString keeps the provider lock when anthropic is absent", () => {
+			const result = resolveModelFromString("anthropic/claude-opus-5", [openRouterOpus5]);
+			expect(result).toBeUndefined();
+		});
+
+		test("resolveCliModel keeps the provider lock when anthropic is absent", () => {
+			const result = resolveCliModel({
+				cliModel: "anthropic/claude-opus-5",
+				modelRegistry: {
+					getAll: () => [openRouterOpus5],
+					getAvailable: () => [],
+				},
+			});
+			expect(result.model).toBeUndefined();
+			expect(result.error).toBeTruthy();
+		});
+
+		test("openai/gpt-4o:extended still resolves to the OpenRouter raw id (openai carries no such id)", () => {
+			const result = parseModelPattern("openai/gpt-4o:extended", allModels);
+			expect(result.model?.provider).toBe("openrouter");
+			expect(result.model?.id).toBe("openai/gpt-4o:extended");
+		});
+	});
+
 	describe("edge cases", () => {
 		test("empty pattern matches via partial matching", () => {
 			// Empty string is included in all model IDs, so partial matching finds a match
@@ -843,7 +928,75 @@ describe("resolveAgentPrewalkPattern", () => {
 		expect(resolveAgentPrewalkPattern({ settingsOverride: "", agentPrewalk: false })).toBeUndefined();
 	});
 });
+describe("resolveAgentAdvisorSelection", () => {
+	test("agent definition alone decides: true → advisor role, pattern → custom model, false/absent → off", () => {
+		expect(resolveAgentAdvisorSelection({ agentAdvisor: true })).toEqual({});
+		expect(resolveAgentAdvisorSelection({ agentAdvisor: "moonshot/k3" })).toEqual({ model: "moonshot/k3" });
+		expect(resolveAgentAdvisorSelection({ agentAdvisor: false })).toBeUndefined();
+		expect(resolveAgentAdvisorSelection({})).toBeUndefined();
+	});
+
+	test("settings override wins over the agent definition", () => {
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "off", agentAdvisor: true })).toBeUndefined();
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "off", agentAdvisor: "moonshot/k3" })).toBeUndefined();
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "on", agentAdvisor: false })).toEqual({});
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "openai/gpt-4o", agentAdvisor: false })).toEqual({
+			model: "openai/gpt-4o",
+		});
+	});
+
+	test("override 'on' keeps the agent's custom advisor model when one is defined", () => {
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "on", agentAdvisor: "moonshot/k3" })).toEqual({
+			model: "moonshot/k3",
+		});
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "on" })).toEqual({});
+	});
+
+	test("blank override falls through to the agent definition", () => {
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "  ", agentAdvisor: true })).toEqual({});
+		expect(resolveAgentAdvisorSelection({ settingsOverride: "", agentAdvisor: false })).toBeUndefined();
+	});
+});
 describe("resolveAgentModelPatterns", () => {
+	test("pairs the first non-empty source's role with its patterns, skipping aliases with no patterns", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				empty: "",
+				override: "openai/gpt-4o",
+				definition: "anthropic/claude-sonnet-4-5",
+			},
+		});
+
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "",
+				settingsOverride: "@override",
+				agentModel: ["@definition"],
+				settings,
+			}),
+		).toEqual({ patterns: ["openai/gpt-4o"], role: "override" });
+
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "@empty",
+				settingsOverride: ",,",
+				agentModel: ["@definition"],
+				settings,
+			}),
+		).toEqual({ patterns: ["anthropic/claude-sonnet-4-5"], role: "definition" });
+
+		// An explicit selector carries no role identity, so the child must not
+		// capture the routing of a role that happens to name the same model.
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "openai/gpt-4o",
+				settingsOverride: "@override",
+				agentModel: ["@definition"],
+				settings,
+			}),
+		).toEqual({ patterns: ["openai/gpt-4o"], role: undefined });
+	});
+
 	test("falls back to the active session model when @task is unset", () => {
 		const settings = Settings.isolated({
 			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
@@ -992,9 +1145,9 @@ describe("resolveModelOverride", () => {
 });
 describe("resolveCliModel", () => {
 	test("resolves --model provider/id without --provider", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliModel: "openai/gpt-4o",
@@ -1006,10 +1159,253 @@ describe("resolveCliModel", () => {
 		expect(result.model?.id).toBe("gpt-4o");
 	});
 
+	test("prefers an authenticated provider for an unqualified exact model id", () => {
+		const availableModels = openaiGpt55Models.filter(model => model.provider === "openai-codex");
+		const registry = { getAll: () => openaiGpt55Models, getAvailable: () => openaiGpt55Models };
+
+		const result = resolveCliModel({
+			cliModel: "gpt-5.5",
+			modelRegistry: registry,
+			availableModels,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openai-codex");
+		expect(result.model?.id).toBe("gpt-5.5");
+	});
+
+	test("prefers an authenticated provider for flat slashful ids whose prefix is a provider slug", () => {
+		const mirror = (provider: string, baseUrl: string): Model<"anthropic-messages"> =>
+			buildModel({
+				id: "openai/gpt-oss-120b",
+				name: "GPT-OSS 120B",
+				api: "anthropic-messages",
+				provider,
+				baseUrl,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+				contextWindow: 128000,
+				maxTokens: 4096,
+			});
+		const catalogFirst = mirror("fireworks", "https://api.fireworks.ai");
+		const authenticated = mirror("openrouter", "https://openrouter.ai");
+		// "openai" is a real provider slug in the catalog, but it does not carry
+		// this model — the selector is a flat aggregator id, not provider/id.
+		const catalog = [...allModels, catalogFirst, authenticated];
+
+		const result = resolveCliModel({
+			cliModel: "openai/gpt-oss-120b",
+			modelRegistry: { getAll: () => catalog, getAvailable: () => [authenticated] },
+			availableModels: [authenticated],
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openrouter");
+		expect(result.model?.id).toBe("openai/gpt-oss-120b");
+	});
+
+	test("resolves bare configured role names from --model", () => {
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
+		const settings = Settings.isolated({
+			modelRoles: { task: "openai/gpt-4o" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openai");
+		expect(result.model?.id).toBe("gpt-4o");
+	});
+
+	test("resolves bare configured role names with thinking suffixes", () => {
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
+		const settings = Settings.isolated({
+			modelRoles: { task: "anthropic/claude-sonnet-4-5" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task:high",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.id).toBe("claude-sonnet-4-5");
+		expect(result.thinkingLevel).toBe(Effort.High);
+		expect(result.configuredPatterns).toEqual(["anthropic/claude-sonnet-4-5:high"]);
+	});
+
+	test("preserves configured role fallback selectors for deferred resolution", () => {
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: "openrouter/z-ai/glm-4.7@cerebras,anthropic/claude-sonnet-4-5",
+			},
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.configuredPatterns).toEqual(["openrouter/z-ai/glm-4.7@cerebras", "anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("reports when a configured role matches after unresolved candidates", () => {
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
+		const settings = Settings.isolated({
+			modelRoles: {
+				task: "runtime-provider/runtime-model,anthropic/claude-sonnet-4-5",
+			},
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model?.provider).toBe("anthropic");
+		expect(result.configuredPatternIndex).toBe(1);
+		expect(result.configuredPatterns).toEqual(["runtime-provider/runtime-model", "anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("does not fuzzy-match unresolved configured roles", () => {
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
+		const settings = Settings.isolated({
+			modelRoles: { sonnet: "runtime-provider/runtime-model" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "sonnet",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.configuredPatterns).toEqual(["runtime-provider/runtime-model"]);
+		expect(result.error).toContain('Model "sonnet" not found');
+	});
+
+	test("keeps unknown --model names on the not-found path", () => {
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
+
+		const result = resolveCliModel({
+			cliModel: "not-a-model",
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain('Model "not-a-model" not found');
+	});
+
+	test("prefers an exact model name over a same-named configured role", () => {
+		const exactModel = buildModel({
+			id: "task",
+			name: "Task",
+			api: "anthropic-messages",
+			provider: "openai",
+			baseUrl: "https://api.openai.com",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 5, output: 15, cacheRead: 0.5, cacheWrite: 5 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+		});
+		const registry = { getAll: () => [...allModels, exactModel], getAvailable: () => [...allModels, exactModel] };
+		const settings = Settings.isolated({
+			modelRoles: { task: "anthropic/claude-sonnet-4-5" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "task",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model).toBe(exactModel);
+		const suffixed = resolveCliModel({
+			cliModel: "task:high",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(suffixed.error).toBeUndefined();
+		expect(suffixed.model).toBe(exactModel);
+		expect(suffixed.thinkingLevel).toBe(Effort.High);
+	});
+
+	test("configured role beats an unauthenticated catalog id collision (#6508)", () => {
+		// A bundled `cursor/default` model has the bare id `default`, which collides
+		// with the reserved `default` role selector. When the user has no Cursor
+		// credentials the catalog entry is not authenticated, so it must not shadow
+		// a configured, runnable `modelRoles.default`.
+		const cursorDefault = buildModel({
+			id: "default",
+			name: "Cursor Default",
+			api: "anthropic-messages",
+			provider: "cursor",
+			baseUrl: "https://cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+		});
+		const registry = { getAll: () => [...allModels, cursorDefault], getAvailable: () => allModels };
+		const settings = Settings.isolated({
+			modelRoles: { default: "openai/gpt-4o" },
+		});
+
+		const result = resolveCliModel({
+			cliModel: "default",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.provider).toBe("openai");
+		expect(result.model?.id).toBe("gpt-4o");
+	});
+
+	test("unauthenticated catalog id still resolves when no role matches", () => {
+		// Without a configured role the same bare id must still reach the catalog
+		// model (so `--model default` surfaces the usual "no API key" error rather
+		// than a spurious not-found), confirming the fallback is only deferred.
+		const cursorDefault = buildModel({
+			id: "default",
+			name: "Cursor Default",
+			api: "anthropic-messages",
+			provider: "cursor",
+			baseUrl: "https://cursor.sh",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 4096,
+		});
+		const registry = { getAll: () => [...allModels, cursorDefault], getAvailable: () => allModels };
+		const settings = Settings.isolated({ modelRoles: {} });
+
+		const result = resolveCliModel({
+			cliModel: "default",
+			modelRegistry: registry,
+			settings,
+		});
+
+		expect(result.model?.provider).toBe("cursor");
+		expect(result.model?.id).toBe("default");
+	});
+
 	test("resolves configured custom, legacy, and default role aliases from --model", () => {
-		const registry = {
-			getAll: () => allModels,
-		};
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
 		const settings = Settings.isolated({
 			modelRoles: {
 				default: "openai/gpt-4o",
@@ -1043,9 +1439,7 @@ describe("resolveCliModel", () => {
 	});
 
 	test("splits thinking suffixes and abbreviations off the * default alias", () => {
-		const registry = {
-			getAll: () => allModels,
-		};
+		const registry = { getAll: () => allModels, getAvailable: () => allModels };
 		const settings = Settings.isolated({
 			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
 		});
@@ -1071,9 +1465,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("resolves fuzzy patterns within an explicit provider", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliProvider: "openai",
@@ -1087,9 +1481,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("supports --model <pattern>:<thinking> (without explicit --thinking)", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliModel: "sonnet:high",
@@ -1102,9 +1496,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("prefers exact model id match over provider inference (OpenRouter-style ids)", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliModel: "openai/gpt-4o:extended",
@@ -1117,9 +1511,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("does not strip invalid :suffix as thinking level in --model (fail fast)", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliProvider: "openai",
@@ -1132,9 +1526,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("supports provider-prefixed OpenRouter route suffixes even when the base model is cataloged without them", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliModel: "openrouter/z-ai/glm-4.7-20251222:nitro",
@@ -1147,9 +1541,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("supports explicit OpenRouter provider with route suffixes that are not in the catalog", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliProvider: "openrouter",
@@ -1169,16 +1563,12 @@ describe("resolveCliModel", () => {
 		const baseResult = resolveCliModel({
 			cliProvider: "amazon-bedrock",
 			cliModel: profileArn,
-			modelRegistry: {
-				getAll: () => [defaultBedrockModel],
-			},
+			modelRegistry: { getAll: () => [defaultBedrockModel], getAvailable: () => [defaultBedrockModel] },
 		});
 		const offResult = resolveCliModel({
 			cliProvider: "amazon-bedrock",
 			cliModel: `${profileArn}:off`,
-			modelRegistry: {
-				getAll: () => [defaultBedrockModel],
-			},
+			modelRegistry: { getAll: () => [defaultBedrockModel], getAvailable: () => [defaultBedrockModel] },
 		});
 
 		expect(baseResult.error).toBeUndefined();
@@ -1197,9 +1587,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("returns a clear error when there are no models", () => {
-		const registry = {
-			getAll: () => [],
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => [], getAvailable: () => [] } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliProvider: "openai",
@@ -1212,9 +1602,9 @@ describe("resolveCliModel", () => {
 	});
 
 	test("resolves provider-prefixed fuzzy patterns (openrouter/qwen -> openrouter model)", () => {
-		const registry = {
-			getAll: () => allModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliModel: "openrouter/qwen",
@@ -1255,9 +1645,9 @@ describe("resolveCliModel", () => {
 				maxTokens: 4096,
 			}),
 		];
-		const registry = {
-			getAll: () => ambiguousModels,
-		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => ambiguousModels, getAvailable: () => ambiguousModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 
 		const result = resolveCliModel({
 			cliModel: "zai/glm-5",
@@ -1462,6 +1852,29 @@ describe("resolveModelFromString", () => {
 	});
 });
 
+describe("resolveExplicitModelRole", () => {
+	test("extracts built-in, custom, legacy, default, and thinking-suffixed aliases before expansion", () => {
+		const settings = Settings.isolated({
+			modelRoles: {
+				reviewer: "openai/gpt-4o",
+			},
+		});
+
+		expect(resolveExplicitModelRole("@task", settings)).toBe("task");
+		expect(resolveExplicitModelRole("pi/reviewer:high", settings)).toBe("reviewer");
+		expect(resolveExplicitModelRole("@reviewer:xhigh", settings)).toBe("reviewer");
+		expect(resolveExplicitModelRole("*:low", settings)).toBe("default");
+	});
+
+	test("does not infer a role from an explicit model selector", () => {
+		const settings = Settings.isolated({ modelRoles: { reviewer: "openai/gpt-4o" } });
+		expect(resolveExplicitModelRole("openai/gpt-4o", settings)).toBeUndefined();
+		expect(resolveExplicitModelRole("openai/gpt-4o:high", settings)).toBeUndefined();
+		expect(resolveExplicitModelRole("openai/gpt-4o:max", settings)).toBeUndefined();
+		expect(resolveExplicitModelRole(["openai/gpt-4o", "@reviewer:high"], settings)).toBe("reviewer");
+	});
+});
+
 describe("expandRoleAlias", () => {
 	test("expands @vision to configured vision role", () => {
 		const settings = Settings.isolated();
@@ -1619,7 +2032,9 @@ describe("provider routing selector (@upstream)", () => {
 	});
 
 	test("resolveCliModel round-trips @upstream in the selector and carries compat", () => {
-		const registry = { getAll: () => allModels } as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
+		const registry = { getAll: () => allModels, getAvailable: () => allModels } as unknown as Parameters<
+			typeof resolveCliModel
+		>[0]["modelRegistry"];
 		const result = resolveCliModel({ cliModel: "openrouter/z-ai/glm-4.7@cerebras", modelRegistry: registry });
 		expect(result.model?.id).toBe("z-ai/glm-4.7");
 		expect(result.selector).toBe("openrouter/z-ai/glm-4.7@cerebras");
