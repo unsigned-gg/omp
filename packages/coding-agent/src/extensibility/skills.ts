@@ -7,7 +7,7 @@ import {
 	sanitizeManagedDescription,
 } from "../autolearn/managed-skills";
 import { skillCapability } from "../capability/skill";
-import type { SourceMeta } from "../capability/types";
+import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
@@ -66,6 +66,55 @@ export function resetActiveSkillsForTests(): void {
 	activeSkills = [];
 }
 
+const CORE_SKILL_PROVIDERS: Record<string, true> = {
+	native: true,
+	agents: true,
+	[MANAGED_SKILLS_PROVIDER_ID]: true,
+};
+
+/**
+ * Select skill summaries for the system prompt without changing discovery.
+ * Explicit `skill://` loads, slash commands, and local search still use the
+ * complete active skill snapshot.
+ */
+export function filterSkillsForPrompt(
+	skills: readonly Skill[],
+	settings?: Pick<SkillsSettings, "promptMode" | "promptSkills">,
+): Skill[] {
+	const mode = settings?.promptMode ?? "all";
+	if (mode === "all") return [...skills];
+
+	if (mode === "core") {
+		return skills.filter(skill => {
+			const provider = skill._source?.provider ?? skill.source.split(":", 1)[0];
+			return CORE_SKILL_PROVIDERS[provider] === true;
+		});
+	}
+
+	const patterns = settings?.promptSkills ?? [];
+	if (patterns.length === 0) return [];
+	const globs = patterns.map(pattern => new Bun.Glob(pattern));
+	return skills.filter(skill => globs.some(glob => glob.match(skill.name)));
+}
+
+/**
+ * Skills actually listed in the rendered system prompt, composing
+ * {@link filterSkillsForPrompt} with the two renderer gates: the `read` tool
+ * must be present so the model can fetch skill content, and skills with
+ * frontmatter `hide: true` (still loadable via `skill://` and `/skill:<name>`)
+ * are excluded. Single source for the prompt renderer (system-prompt.ts) and
+ * context accounting (context-usage.ts) so both stay aligned with the
+ * provider-facing prompt.
+ */
+export function selectSkillsForPrompt(
+	skills: readonly Skill[],
+	hasReadTool: boolean,
+	settings?: Pick<SkillsSettings, "promptMode" | "promptSkills">,
+): Skill[] {
+	if (!hasReadTool) return [];
+	return filterSkillsForPrompt(skills, settings).filter(skill => skill.hide !== true);
+}
+
 /**
  * Whether `name` is already claimed by an active authored (non-managed) skill.
  *
@@ -120,6 +169,12 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
+	/**
+	 * Session-local extension roots. Post-startup reloads pass their live
+	 * session value so explicit roots, discovery mode, and configured
+	 * extensions all survive outside the construction-time invocation scope.
+	 */
+	extensionRoots?: EffectiveExtensionRoots;
 }
 
 /**
@@ -141,6 +196,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		ignoredSkills = [],
 		includeSkills = [],
 		disabledExtensions = [],
+		extensionRoots,
 	} = options;
 
 	// Early return if skills are disabled
@@ -175,7 +231,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	}
 
 	// Use capability API to load all skills
-	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, disabledExtensions });
+	const result = await loadCapability<CapabilitySkill>(skillCapability.id, {
+		cwd,
+		disabledExtensions,
+		extensionRoots,
+	});
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();

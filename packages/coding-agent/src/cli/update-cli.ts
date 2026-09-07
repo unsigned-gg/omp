@@ -181,11 +181,17 @@ export function shouldForceBinaryUpdate(
 
 /**
  * Select and validate the binary asset from GitHub release metadata.
+ *
+ * Draft releases are always rejected. Prereleases are rejected unless
+ * `options.allowPrerelease` is set, which the canary channel passes: canary
+ * GitHub releases are published as prereleases, and the exact-tag match below
+ * still pins the download to the specific requested version.
  */
 export function resolveReleaseBinaryAsset(
 	release: unknown,
 	expectedTag: string,
 	binaryName: string,
+	options: { allowPrerelease?: boolean } = {},
 ): ReleaseBinaryAsset {
 	if (!isRecord(release)) {
 		throw new Error("Invalid GitHub release metadata");
@@ -193,8 +199,11 @@ export function resolveReleaseBinaryAsset(
 	if (release.tag_name !== expectedTag) {
 		throw new Error(`GitHub release tag mismatch: expected ${expectedTag}`);
 	}
-	if (release.draft !== false || release.prerelease !== false) {
-		throw new Error(`GitHub release ${expectedTag} is not a published stable release`);
+	if (release.draft !== false) {
+		throw new Error(`GitHub release ${expectedTag} is a draft, not a published release`);
+	}
+	if (release.prerelease !== false && !options.allowPrerelease) {
+		throw new Error(`GitHub release ${expectedTag} is a prerelease; only canary updates install prerelease assets`);
 	}
 	if (!Array.isArray(release.assets)) {
 		throw new Error(`GitHub release ${expectedTag} has no asset list`);
@@ -232,12 +241,11 @@ export function resolveReleaseBinaryAsset(
 	};
 }
 
-async function getReleaseBinaryAsset(
+async function fetchReleaseMetadata(
 	expectedVersion: string,
-	binaryName: string,
 	fetchImpl: Fetch = fetch,
 	githubToken: string | undefined = $env.GITHUB_TOKEN || $env.GH_TOKEN,
-): Promise<ReleaseBinaryAsset> {
+): Promise<unknown> {
 	const tag = `v${expectedVersion}`;
 	const headers: Record<string, string> = {
 		Accept: "application/vnd.github+json",
@@ -267,7 +275,22 @@ async function getReleaseBinaryAsset(
 		throw new Error(`Failed to fetch GitHub release metadata: ${response.statusText}`);
 	}
 
-	return resolveReleaseBinaryAsset(await response.json(), tag, binaryName);
+	return response.json();
+}
+
+async function getReleaseBinaryAsset(
+	expectedVersion: string,
+	binaryName: string,
+	fetchImpl: Fetch = fetch,
+	githubToken: string | undefined = $env.GITHUB_TOKEN || $env.GH_TOKEN,
+	allowPrerelease = false,
+): Promise<ReleaseBinaryAsset> {
+	return resolveReleaseBinaryAsset(
+		await fetchReleaseMetadata(expectedVersion, fetchImpl, githubToken),
+		`v${expectedVersion}`,
+		binaryName,
+		{ allowPrerelease },
+	);
 }
 
 export interface VerifiedBinaryDownloadOptions {
@@ -347,13 +370,18 @@ export interface InstalledVersionVerification {
 	path?: string;
 }
 
-/** Paths and verifier used while replacing a downloaded binary update. */
+/** Paths and verifier used while replacing a downloaded binary update. When
+ * `worker` is set (Darwin arm64 binary updates) the `stt-nemotron` worker is
+ * swapped inside the same transaction: both files install together, and a
+ * failure of either rolls both back.
+ */
 export interface BinaryReplacementOptions {
 	targetPath: string;
 	tempPath: string;
 	backupPath: string;
 	expectedVersion: string;
 	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+	worker?: { targetPath: string; tempPath: string; backupPath: string };
 }
 
 /**
@@ -1110,6 +1138,18 @@ function getBinaryName(): string {
 	}
 	return `${APP_NAME}-${os}-${archName}`;
 }
+/**
+ * Release asset name of the adjacent Nemotron STT worker for a binary asset,
+ * or null when that platform ships no worker (everything but darwin-arm64).
+ * The compiled runtime resolves the worker only beside `process.execPath`
+ * (src/stt/nemotron-worker-client.ts) with no fallback, so every
+ * darwin-arm64 binary install must also fetch this asset and install it as
+ * `stt-nemotron` beside omp. Keyed on the binary asset name (not the host)
+ * so overrides like `binaryName` keep the pair consistent.
+ */
+export function sttWorkerAssetNameForBinaryName(binaryName: string): string | null {
+	return binaryName === "omp-darwin-arm64" ? "omp-stt-nemotron-darwin-arm64" : null;
+}
 
 /**
  * Resolve the path that `omp` maps to in the user's PATH.
@@ -1119,16 +1159,25 @@ function resolveOmpPath(): string | undefined {
 }
 
 /**
+ * Parse the version a launcher reports from `omp --version` output
+ * (`omp/X.Y.Z`, or a prerelease such as `omp/X.Y.Z-canary.1`).
+ *
+ * The prerelease suffix is preserved so a correctly installed canary build
+ * verifies as up to date instead of appearing to report a stale `X.Y.Z` and
+ * being mistaken for an unreplaced launcher.
+ */
+export function parseReportedVersion(output: string): string | undefined {
+	return output.match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/)?.[1];
+}
+
+/**
  * Run a specific binary and check if it reports the expected version.
  */
 async function verifyBinaryAtPath(binaryPath: string, expectedVersion: string): Promise<InstalledVersionVerification> {
 	try {
 		const result = await $`${binaryPath} --version`.quiet().nothrow();
 		if (result.exitCode !== 0) return { ok: false, path: binaryPath };
-		const output = result.text().trim();
-		// Output format: "omp/X.Y.Z"
-		const match = output.match(/\/(\d+\.\d+\.\d+)/);
-		const actual = match?.[1];
+		const actual = parseReportedVersion(result.text().trim());
 		return { ok: actual === expectedVersion, actual, path: binaryPath };
 	} catch {
 		return { ok: false, path: binaryPath };
@@ -1251,18 +1300,36 @@ export async function sweepStaleUpdateArtifacts(targetPath: string): Promise<voi
 
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
+ *
+ * When `options.worker` is set, the adjacent `stt-nemotron` worker swaps
+ * inside the same transaction: it installs FIRST, so a worker-side failure
+ * aborts before the omp binary is touched, and any later failure rolls the
+ * pair back together — never a new worker beside a restored older omp, and
+ * never a replaced omp without its worker.
  */
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
+	const worker = options.worker;
 	let backupReady = false;
+	let workerBackupReady = false;
+	let workerInstalled = false;
 	try {
+		if (worker) {
+			// Move any existing worker aside (no previous worker is fine on a
+			// fresh install); the catch below restores it untouched on failure.
+			try {
+				await fs.promises.rename(worker.targetPath, worker.backupPath);
+				workerBackupReady = true;
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+			await fs.promises.rename(worker.tempPath, worker.targetPath);
+			workerInstalled = true;
+		}
 		// `backupPath` is unique per attempt (see updateViaBinaryAt), so this rename
 		// never has to overwrite — or unlink — a possibly-locked leftover from an
 		// earlier run. Renaming the running executable itself is permitted on
 		// Windows; only deleting its still-mapped image is not.
-		// A missing target is tolerated: repairing a launcher that a failed
-		// package-manager reinstall removed installs the binary at a vacant
-		// path. There is then nothing to restore, so a verification failure
-		// leaves the new binary in place rather than the previous nothing.
+		// A missing target is tolerated when repairing a vacated launcher path.
 		try {
 			await fs.promises.rename(options.targetPath, options.backupPath);
 			backupReady = true;
@@ -1282,14 +1349,39 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		// Swap done and verified. On Windows the backup is still the running
 		// process image and cannot be unlinked until this process exits, so a
 		// failure here must NOT fail an otherwise-successful update.
+		if (worker) {
+			await removeBackupBestEffort(worker.backupPath);
+		}
 		await removeBackupBestEffort(options.backupPath);
 		return verification;
 	} catch (err) {
-		if (backupReady) {
-			await unlinkIfExists(options.targetPath);
-			await fs.promises.rename(options.backupPath, options.targetPath);
+		const rollbackErrors: unknown[] = [];
+		const attemptRollback = async (operation: () => Promise<unknown>): Promise<void> => {
+			try {
+				await operation();
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		};
+		if (worker) {
+			if (workerInstalled) {
+				await attemptRollback(() => unlinkIfExists(worker.targetPath));
+			}
+			if (workerBackupReady) {
+				await attemptRollback(() => fs.promises.rename(worker.backupPath, worker.targetPath));
+			} else {
+				await attemptRollback(() => unlinkIfExists(worker.tempPath));
+			}
 		}
-		await unlinkIfExists(options.tempPath);
+		if (backupReady) {
+			await attemptRollback(() => unlinkIfExists(options.targetPath));
+			await attemptRollback(() => fs.promises.rename(options.backupPath, options.targetPath));
+		}
+		await attemptRollback(() => unlinkIfExists(options.tempPath));
+		if (rollbackErrors.length > 0) {
+			const message = err instanceof Error ? err.message : String(err);
+			throw new AggregateError(rollbackErrors, `${message}; rollback incomplete`, { cause: err });
+		}
 		throw err;
 	}
 }
@@ -1481,7 +1573,7 @@ export async function migrateRenamedInstall(release: ReleaseInfo, steps: RenameM
 	}
 	if (!verification.ok) {
 		throw new Error(
-			`${formatVerificationFailure(verification, release.version)}; reinstall with: curl -fsSL https://omp.sh/install | sh`,
+			`${formatVerificationFailure(verification, release.version)}; reinstall with: ${installerHint()}`,
 		);
 	}
 	printVerifiedVersion(release.version);
@@ -1549,7 +1641,11 @@ export interface ManagerUpdateSteps {
 }
 
 /** Production {@link ManagerUpdateSteps}: a bun/npm global install plus an in-place binary takeover. */
-function packageManagerUpdateSteps(manager: "bun" | "npm", release: ReleaseInfo): ManagerUpdateSteps {
+function packageManagerUpdateSteps(
+	manager: "bun" | "npm",
+	release: ReleaseInfo,
+	allowPrerelease: boolean,
+): ManagerUpdateSteps {
 	return {
 		manager,
 		install: () => (manager === "bun" ? updateViaBun(release) : updateViaNpm(release)),
@@ -1557,30 +1653,31 @@ function packageManagerUpdateSteps(manager: "bun" | "npm", release: ReleaseInfo)
 		repair: async launcherPath => {
 			// npm's script shims outrank `.exe` in PowerShell and Git Bash, so
 			// they must be retired rather than merely shadowed.
-			if (isWindowsScriptLauncherPath(launcherPath)) await updateViaShimTakeover(launcherPath, release.version);
-			else await updateViaBinaryAt(launcherPath, release.version);
+			if (isWindowsScriptLauncherPath(launcherPath)) {
+				await updateViaShimTakeover(launcherPath, release.version, { allowPrerelease });
+			} else {
+				await updateViaBinaryAt(launcherPath, release.version, { allowPrerelease });
+			}
 		},
 	};
 }
 
 /**
  * Run a package-manager self-update, repairing the launcher when the manager
- * leaves this install without a working `omp`.
+ * succeeds without updating it or leaves no working launcher behind.
  *
  * A global reinstall has to replace files the running process still holds open.
  * On Windows that is unavoidable — the launcher image, the loaded native addon,
- * and the package tree being executed are all locked — and either manager can
- * end the attempt with no usable launcher: npm moves the global bin shims aside
- * before unpacking and restores them only if its own rollback succeeds, and bun
- * aborts the whole install on the first file it cannot overwrite, which leaves
- * a half-replaced package the launcher can no longer run.
+ * and the package tree being executed are all locked. Bun writes the new
+ * `.bunx` metadata before ignoring EBUSY from the launcher replacement, while
+ * npm can retire its shims before an install fails.
  *
- * Only a launcher that is gone from PATH, or that can no longer report a
- * version, is repaired — by taking its path over with the standalone release
- * binary. A launcher that still reports the old version means the install did
- * not land (usually a transient registry failure): the previous version keeps
- * working, so that case surfaces the error and leaves the managed install
- * alone instead of migrating a healthy install off its manager.
+ * A successful install whose PATH launcher still reports an older version
+ * means the manager no longer controls that launcher, so it is taken over with
+ * the standalone binary. A newer launcher may have been installed by a
+ * concurrent update and is left untouched. If the install itself failed, a
+ * launcher that still reports a version is preserved and the manager error is
+ * surfaced; only a missing or unusable launcher is repaired.
  */
 export async function updateViaManager(
 	release: ReleaseInfo,
@@ -1597,8 +1694,11 @@ export async function updateViaManager(
 		installError = err;
 	}
 	const result = verification ?? (await steps.verify());
-	const launcherBroken = !result.ok && (result.path === undefined || result.actual === undefined);
-	if (!launcherBroken) {
+	const launcherIsBroken = result.path === undefined || result.actual === undefined;
+	const launcherIsOlder =
+		installError === undefined && result.actual !== undefined && compareVersions(result.actual, release.version) < 0;
+	const launcherNeedsRepair = !result.ok && (launcherIsBroken || launcherIsOlder);
+	if (!launcherNeedsRepair) {
 		if (installError) throw installError;
 		printVerificationResult(result, release.version);
 		return;
@@ -1608,13 +1708,13 @@ export async function updateViaManager(
 	}
 	console.log(
 		chalk.yellow(
-			`\n${steps.manager} left no working ${APP_NAME} launcher (${formatVerificationFailure(result, release.version)}); installing the standalone binary at ${launcherPath}.`,
+			`\n${steps.manager} did not install a working ${APP_NAME} ${release.version} launcher (${formatVerificationFailure(result, release.version)}); installing the standalone binary at ${launcherPath}.`,
 		),
 	);
 	try {
 		await steps.repair(launcherPath);
 	} catch (err) {
-		throw new Error(`${steps.manager} install failed and the launcher could not be repaired: ${err}`, {
+		throw new Error(`${steps.manager} update did not produce a working launcher and binary repair failed: ${err}`, {
 			cause: installError ?? err,
 		});
 	}
@@ -1668,6 +1768,10 @@ let updateAttemptSeq = 0;
 
 /**
  * Download a release binary to a target path, replacing an existing file.
+ *
+ * On darwin-arm64 the release's `stt-nemotron` worker asset downloads and
+ * swaps in the same transaction, so the updated omp is never left without
+ * its adjacent worker (and a worker-side failure never touches omp).
  */
 export async function updateViaBinaryAt(
 	targetPath: string,
@@ -1676,10 +1780,12 @@ export async function updateViaBinaryAt(
 		binaryName?: string;
 		fetchImpl?: Fetch;
 		githubToken?: string;
+		allowPrerelease?: boolean;
 		verifyInstalledVersion?: typeof verifyInstalledVersion;
 	} = {},
 ): Promise<void> {
 	const binaryName = options.binaryName ?? getBinaryName();
+	const workerAssetName = sttWorkerAssetNameForBinaryName(binaryName);
 	// Unique per attempt so two overlapping `omp update` runs never share a temp
 	// or backup path. A fixed temp name (`<binary>.new`) let the second run's
 	// pre-download unlink delete the first run's still-downloading temp file; the
@@ -1692,21 +1798,51 @@ export async function updateViaBinaryAt(
 	const attempt = `${Date.now()}.${process.pid}.${updateAttemptSeq++}`;
 	const tempPath = `${targetPath}.${attempt}.new`;
 	const backupPath = `${targetPath}.${attempt}.bak`;
-	const asset = await getReleaseBinaryAsset(expectedVersion, binaryName, options.fetchImpl, options.githubToken);
-	console.log(chalk.dim(`Downloading ${binaryName}…`));
-	await downloadVerifiedBinary({
-		url: asset.url,
-		targetPath: tempPath,
-		expectedSize: asset.size,
-		expectedDigest: asset.digest,
-		fetchImpl: options.fetchImpl,
+	// The worker installs under its runtime-facing name beside the binary; the
+	// same unique-attempt suffixing lets the artifact sweep reclaim its temps.
+	const workerTargetPath = path.join(path.dirname(targetPath), "stt-nemotron");
+	const workerTempPath = `${workerTargetPath}.${attempt}.new`;
+	const workerBackupPath = `${workerTargetPath}.${attempt}.bak`;
+	const release = await fetchReleaseMetadata(expectedVersion, options.fetchImpl, options.githubToken);
+	const tag = `v${expectedVersion}`;
+	const asset = resolveReleaseBinaryAsset(release, tag, binaryName, {
+		allowPrerelease: options.allowPrerelease,
 	});
-	console.log(chalk.dim(`Verified ${asset.digest}`));
+	// A darwin-arm64 release without its worker asset is broken; refuse the
+	// update rather than install a workerless omp.
+	const workerAsset = workerAssetName
+		? resolveReleaseBinaryAsset(release, tag, workerAssetName, { allowPrerelease: options.allowPrerelease })
+		: null;
+	try {
+		console.log(chalk.dim(`Downloading ${binaryName}…`));
+		await downloadVerifiedBinary({
+			url: asset.url,
+			targetPath: tempPath,
+			expectedSize: asset.size,
+			expectedDigest: asset.digest,
+			fetchImpl: options.fetchImpl,
+		});
+		console.log(chalk.dim(`Verified ${asset.digest}`));
+		if (workerAsset && workerAssetName) {
+			console.log(chalk.dim(`Downloading ${workerAssetName}…`));
+			await downloadVerifiedBinary({
+				url: workerAsset.url,
+				targetPath: workerTempPath,
+				expectedSize: workerAsset.size,
+				expectedDigest: workerAsset.digest,
+				fetchImpl: options.fetchImpl,
+			});
+			console.log(chalk.dim(`Verified ${workerAsset.digest}`));
+		}
+	} catch (error) {
+		await Promise.allSettled([unlinkIfExists(tempPath), unlinkIfExists(workerTempPath)]);
+		throw error;
+	}
 
 	// Serialize the target swap and stale-artifact sweep per target so two
 	// overlapping `omp update` runs never replace the same binary concurrently
 	// or reclaim each other's live backup/temp files. The download above writes
-	// to a unique temp path and is safe to overlap; only the swap is shared.
+	// to unique temp paths and is safe to overlap; only the swap is shared.
 	await withFileLock(targetPath, async () => {
 		console.log(chalk.dim("Installing update..."));
 		await replaceBinaryForUpdate({
@@ -1715,6 +1851,9 @@ export async function updateViaBinaryAt(
 			backupPath,
 			expectedVersion,
 			verifyInstalledVersion: options.verifyInstalledVersion ?? verifyInstalledVersion,
+			worker: workerAsset
+				? { targetPath: workerTargetPath, tempPath: workerTempPath, backupPath: workerBackupPath }
+				: undefined,
 		});
 		// The launcher is no longer bun-managed: drop bun's metadata sidecar so
 		// the next update classifies this install as a standalone binary instead
@@ -1728,6 +1867,9 @@ export async function updateViaBinaryAt(
 		} catch {}
 		// Reclaim backups from earlier updates whose owning process has since exited.
 		await sweepStaleUpdateArtifacts(targetPath);
+		if (workerAsset) {
+			await sweepStaleUpdateArtifacts(workerTargetPath);
+		}
 	});
 	printVerifiedVersion(expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
@@ -1769,6 +1911,7 @@ export async function updateViaShimTakeover(
 		binaryName?: string;
 		fetchImpl?: Fetch;
 		githubToken?: string;
+		allowPrerelease?: boolean;
 		verifyBinary?: typeof verifyBinaryAtPath;
 	} = {},
 ): Promise<void> {
@@ -1777,7 +1920,13 @@ export async function updateViaShimTakeover(
 	const exePath = path.join(launcherDir, `${APP_NAME}.exe`);
 	const attempt = `${Date.now()}.${process.pid}.${updateAttemptSeq++}`;
 	const tempPath = `${exePath}.${attempt}.new`;
-	const asset = await getReleaseBinaryAsset(expectedVersion, binaryName, options.fetchImpl, options.githubToken);
+	const asset = await getReleaseBinaryAsset(
+		expectedVersion,
+		binaryName,
+		options.fetchImpl,
+		options.githubToken,
+		options.allowPrerelease,
+	);
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
 	await downloadVerifiedBinary({
 		url: asset.url,
@@ -1952,6 +2101,7 @@ export async function runUpdateCommand(opts: {
 	// same PATH entry live.
 	try {
 		const forceBinary = shouldForceBinaryUpdate(release);
+		const allowPrerelease = channel === "canary";
 		const target = await resolveUpdateTarget({ allowPackageManagers: !forceBinary });
 		if (channel === "canary" && (target.method === "nix" || target.method === "brew" || target.method === "mise")) {
 			console.log(chalk.yellow("Canary updates are only supported for bun, npm, or binary installs."));
@@ -1972,20 +2122,24 @@ export async function runUpdateCommand(opts: {
 				// skipped), so the launcher path is always known.
 				if (!target.path) throw new Error(`Could not resolve ${APP_NAME} launcher path in PATH`);
 				console.log(chalk.dim("This release ships as a standalone binary; replacing the script launcher."));
-				await updateViaShimTakeover(target.path, release.version);
+				await updateViaShimTakeover(target.path, release.version, { allowPrerelease });
 				console.log(
 					chalk.yellow(
 						`This install is no longer managed by ${target.method}. Removing the old global package may delete this launcher; if it does, reinstall with: ${installerHint()}`,
 					),
 				);
 			} else {
-				await updateViaManager(release, target.path, packageManagerUpdateSteps(target.method, release));
+				await updateViaManager(
+					release,
+					target.path,
+					packageManagerUpdateSteps(target.method, release, allowPrerelease),
+				);
 			}
 		} else {
 			if (forceBinary && target.replacesSymlink) {
 				console.log(chalk.dim("Replacing the package-manager launcher with the standalone binary."));
 			}
-			await updateViaBinaryAt(target.path, release.version);
+			await updateViaBinaryAt(target.path, release.version, { allowPrerelease });
 			if (forceBinary && target.replacesSymlink) {
 				console.log(
 					chalk.yellow(

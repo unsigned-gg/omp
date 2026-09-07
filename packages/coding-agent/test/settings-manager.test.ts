@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
@@ -7,6 +8,8 @@ import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock
 import { __providerInFlightForTesting, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context } from "@oh-my-pi/pi-ai/types";
 import {
+	getDefault,
+	type MemoriesSettings,
 	onAppendOnlyModeChanged,
 	onCodeModeChanged,
 	onModelRolesChanged,
@@ -14,6 +17,8 @@ import {
 	resetSettingsForTest,
 	type SettingPath,
 	Settings,
+	type SkillsSettings,
+	validatePrimeBridgeApprovalTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -78,7 +83,7 @@ describe("Settings", () => {
 		vi.restoreAllMocks();
 		clearCustomApis();
 		__providerInFlightForTesting.setRoot(undefined);
-		AgentStorage.resetInstance();
+		AgentStorage.close();
 		restoreSettingsTestState(settingsState);
 		settingsState = undefined;
 		await Bun.sleep(0);
@@ -127,6 +132,43 @@ describe("Settings", () => {
 			expect(await Bun.file(yamlConfigPath).exists()).toBe(false);
 			expect((await readSettings()).setupVersion).toBe(1);
 		});
+
+		it("writes mapping headers without trailing whitespace and preserves multiline values", async () => {
+			const multiline = ["first line", "scalar line ending in colon: ", "third line "].join("\n");
+			const custom = {
+				"quoted:key": { nested: [{ value: multiline }] },
+				emptyObject: {},
+				emptyArray: [],
+				emptyString: "",
+			};
+			await writeSettings({ custom, theme: { dark: "anthracite" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.set("theme.dark", "titanium");
+			await settings.flush();
+
+			const content = await Bun.file(getConfigPath()).text();
+			expect(content).not.toMatch(/: +$/m);
+			expect(YAML.parse(content)).toEqual({ custom, theme: { dark: "titanium" } });
+		});
+	});
+
+	it("skips create-only mutations beneath scalar ancestors", async () => {
+		await writeSettings({ compaction: false, modelRoles: "configured" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const before = await Bun.file(getConfigPath()).text();
+
+		const result = await settings.applyCreateOnly([
+			{ path: "compaction.enabled", value: true },
+			{ path: "modelRoles", role: "new", value: "source/new" },
+		]);
+
+		expect(result).toEqual({
+			applied: [],
+			skipped: ["compaction.enabled", "modelRoles:new"],
+		});
+		expect(await Bun.file(getConfigPath()).text()).toBe(before);
+		expect(await readSettings()).toEqual({ compaction: false, modelRoles: "configured" });
 	});
 
 	describe("shell configuration errors", () => {
@@ -298,9 +340,9 @@ describe("Settings", () => {
 			await writeSettings({ setupVersion: 1 });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			const canonicalConfigPath = await fs.promises.realpath(getConfigPath());
-			const rename = fs.promises.rename.bind(fs.promises);
+			const rename = fsp.rename.bind(fsp);
 			let injected = false;
-			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			vi.spyOn(fsp, "rename").mockImplementation(async (source, target) => {
 				if (!injected && String(source).endsWith(".tmp") && String(target) === canonicalConfigPath) {
 					injected = true;
 					throw new FsCodeError("EPERM", "injected Windows replacement failure");
@@ -616,6 +658,94 @@ describe("Settings", () => {
 		});
 	});
 
+	describe("Phase 5 settings schema additions", () => {
+		it("resolves Prime Bridge defaults for the client settings", () => {
+			const settings = Settings.isolated();
+
+			expect(settings.get("primeBridge.enabled")).toBe(false);
+			expect(settings.get("primeBridge.url")).toBeUndefined();
+			expect(settings.get("primeBridge.tokenPath")).toBeUndefined();
+			expect(settings.get("primeBridge.autoStart")).toBe(false);
+		});
+
+		it("resolves configured Prime Bridge client settings", () => {
+			const settings = Settings.isolated({
+				"primeBridge.enabled": true,
+				"primeBridge.url": "http://127.0.0.1:8787",
+				"primeBridge.tokenPath": "/run/user/501/prime.token",
+				"primeBridge.autoStart": true,
+			});
+
+			expect(settings.get("primeBridge.enabled")).toBe(true);
+			expect(settings.get("primeBridge.url")).toBe("http://127.0.0.1:8787");
+			expect(settings.get("primeBridge.tokenPath")).toBe("/run/user/501/prime.token");
+			expect(settings.get("primeBridge.autoStart")).toBe(true);
+		});
+
+		it("resolves Prime Bridge tool-host defaults", () => {
+			const settings = Settings.isolated();
+
+			expect(settings.get("primeBridge.toolHost.enabled")).toBe(false);
+			expect(settings.get("primeBridge.toolHost.allowTools")).toEqual([]);
+			expect(settings.get("primeBridge.toolHost.defaultTools")).toBe(true);
+			expect(settings.get("primeBridge.toolHost.sessionId")).toBeUndefined();
+			expect(settings.get("primeBridge.toolHost.approvalTimeoutMs")).toBe(60_000);
+			expect(getDefault("primeBridge.toolHost.approvalTimeoutMs")).toBe(60_000);
+		});
+
+		it("resolves configured Prime Bridge tool-host settings", () => {
+			const settings = Settings.isolated({
+				"primeBridge.toolHost.enabled": true,
+				"primeBridge.toolHost.allowTools": ["read", "grep"],
+				"primeBridge.toolHost.defaultTools": false,
+				"primeBridge.toolHost.sessionId": "session-fixed",
+				"primeBridge.toolHost.approvalTimeoutMs": 1,
+			});
+
+			expect(settings.get("primeBridge.toolHost.enabled")).toBe(true);
+			expect(settings.get("primeBridge.toolHost.allowTools")).toEqual(["read", "grep"]);
+			expect(settings.get("primeBridge.toolHost.defaultTools")).toBe(false);
+			expect(settings.get("primeBridge.toolHost.sessionId")).toBe("session-fixed");
+			expect(settings.get("primeBridge.toolHost.approvalTimeoutMs")).toBe(1);
+		});
+
+		it("accepts inclusive Prime Bridge approval timeout boundaries", () => {
+			expect(() => validatePrimeBridgeApprovalTimeoutMs(1)).not.toThrow();
+			expect(() => validatePrimeBridgeApprovalTimeoutMs(60_000)).not.toThrow();
+		});
+
+		it("rejects Prime Bridge approval timeouts outside the supported bounds", () => {
+			for (const approvalTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 60_001]) {
+				expect(() => validatePrimeBridgeApprovalTimeoutMs(approvalTimeoutMs)).toThrow(
+					"Prime bridge approvalTimeoutMs must be between 1 and 60000 milliseconds",
+				);
+			}
+		});
+
+		it("defaults skills prompt exposure through the typed skills getter", () => {
+			const skills: SkillsSettings = Settings.isolated().getGroup("skills");
+
+			expect(skills.promptMode).toBe("all");
+			expect(skills.promptSkills).toEqual([]);
+		});
+
+		it("resolves configured skills prompt exposure through the typed skills getter", () => {
+			const skills: SkillsSettings = Settings.isolated({
+				"skills.promptMode": "allowlist",
+				"skills.promptSkills": ["browser", "git"],
+			}).getGroup("skills");
+
+			expect(skills.promptMode).toBe("allowlist");
+			expect(skills.promptSkills).toEqual(["browser", "git"]);
+		});
+
+		it("exposes the phase-one input token limit through the public typed memories group", () => {
+			const memories: MemoriesSettings = Settings.isolated().getGroup("memories");
+
+			expect(memories.phase1InputTokenLimit).toBe(4000);
+		});
+	});
+
 	describe("statusLine.sessionAccent hooks", () => {
 		it("notifies subscribers only when the effective value changes", () => {
 			const isolated = Settings.isolated();
@@ -780,6 +910,66 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.defaultThinkingLevel).toBe(Effort.High);
 		});
+
+		it("preserves a same-key external edit made after a local save was queued", async () => {
+			await writeSettings({
+				defaultThinkingLevel: Effort.Low,
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("defaultThinkingLevel", Effort.High);
+
+			await writeSettings({
+				defaultThinkingLevel: Effort.Medium,
+			});
+			await settings.flush();
+
+			expect((await readSettings()).defaultThinkingLevel).toBe(Effort.Medium);
+			expect(settings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		});
+
+		it("merges a pending local change with a later disjoint external edit", async () => {
+			await writeSettings({
+				defaultThinkingLevel: Effort.Low,
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("defaultThinkingLevel", Effort.High);
+
+			await writeSettings({
+				defaultThinkingLevel: Effort.Low,
+				enabledModels: ["openai/gpt-5.2-codex"],
+			});
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.defaultThinkingLevel).toBe(Effort.High);
+			expect(savedSettings.enabledModels).toEqual(["openai/gpt-5.2-codex"]);
+		});
+		it("reapplies runtime hooks when a later external edit wins", async () => {
+			await writeSettings({
+				provider: { appendOnlyContext: "auto" },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const received: string[] = [];
+			const unsubscribe = onAppendOnlyModeChanged(value => {
+				received.push(value);
+			});
+
+			try {
+				settings.set("provider.appendOnlyContext", "on");
+				await writeSettings({
+					provider: { appendOnlyContext: "off" },
+				});
+				await settings.flush();
+
+				expect(settings.get("provider.appendOnlyContext")).toBe("off");
+				expect(received).toEqual(["on", "off"]);
+			} finally {
+				unsubscribe();
+			}
+		});
 	});
 
 	describe("model role overrides", () => {
@@ -803,6 +993,23 @@ describe("Settings", () => {
 			});
 			expect(settings.getModelRole("default")).toBe("openai/gpt-5.2-codex");
 			expect(settings.getModelRole("smol")).toBe("anthropic/claude-haiku-4-5");
+		});
+
+		it("preserves a same-role external edit made after a local save was queued", async () => {
+			await writeSettings({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.setModelRole("default", "openai/gpt-5.2-codex");
+
+			await writeSettings({
+				modelRoles: { default: "moonshot/kimi-k3:max" },
+			});
+			await settings.flush();
+
+			expect((await readSettings()).modelRoles).toEqual({ default: "moonshot/kimi-k3:max" });
+			expect(settings.getModelRole("default")).toBe("moonshot/kimi-k3:max");
 		});
 
 		it("preserves concurrent external per-role edits when saving one global role", async () => {
@@ -1591,6 +1798,27 @@ describe("Settings", () => {
 					Settings.init({ cwd: projectDir, agentDir, inMemory: true, configFiles: [overlayPath] }),
 				).rejects.toThrow("Provider request limits must be positive numbers: umans");
 			});
+		});
+	});
+
+	describe("extensionsSourceLevel", () => {
+		it("reports project when a foreign project provider (.claude/settings.json) supplies extensions", async () => {
+			const claudeSettings = path.join(projectDir, ".claude", "settings.json");
+			fs.mkdirSync(path.dirname(claudeSettings), { recursive: true });
+			fs.writeFileSync(claudeSettings, JSON.stringify({ extensions: ["../claude-ext"] }));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("extensions")).toContain("../claude-ext");
+			expect(settings.extensionsSourceLevel()).toBe("project");
+		});
+
+		it("reports user for a user-only setting and for runtime overrides", async () => {
+			await writeSettings({ extensions: ["../user-ext"] });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.extensionsSourceLevel()).toBe("user");
+
+			settings.override("extensions", ["../override-ext"]);
+			expect(settings.extensionsSourceLevel()).toBe("user");
 		});
 	});
 });

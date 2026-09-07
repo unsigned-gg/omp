@@ -12,13 +12,19 @@ import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } 
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
-import { type ApprovalMode, formatApprovalPrompt, resolveApproval, truncateForPrompt } from "../../tools/approval";
+import {
+	type ApprovalMode,
+	denyError,
+	formatApprovalPrompt,
+	resolveApproval,
+	truncateForPrompt,
+} from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { RegisteredTool, ToolCallEventResult } from "./types";
+import { type RegisteredTool, snapshotRegisteredTool, type ToolCallEventResult } from "./types";
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
@@ -33,25 +39,33 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	renderCall?: (args: any, options: any, theme: any) => any;
 	renderResult?: (result: any, options: any, theme: any, args?: any) => any;
 	readonly loadMode: ToolLoadMode;
+	private registeredTool: RegisteredTool;
 
 	constructor(
-		private registeredTool: RegisteredTool,
+		registeredTool: RegisteredTool,
 		private runner: ExtensionRunner,
 	) {
-		applyToolProxy(registeredTool.definition, this);
-		this.loadMode = defaultLoadModeForToolName(registeredTool.definition.name, registeredTool.definition.loadMode);
+		this.registeredTool = snapshotRegisteredTool(registeredTool);
+		Object.defineProperty(this, "parameters", {
+			value: this.registeredTool.definition.parameters,
+			enumerable: true,
+		});
+		applyToolProxy(this.registeredTool.definition, this);
+		this.loadMode = defaultLoadModeForToolName(
+			this.registeredTool.definition.name,
+			this.registeredTool.definition.loadMode,
+		);
 
 		// Only define render methods when the underlying definition provides them.
 		// If these exist unconditionally on the prototype, ToolExecutionComponent
 		// enters the custom-renderer path, gets undefined back, and silently
-		// discards tool result text (extensions without renderers show blank).
-		if (registeredTool.definition.renderCall) {
+		if (this.registeredTool.definition.renderCall) {
 			this.renderCall = (args: any, options: any, theme: any) =>
-				registeredTool.definition.renderCall!(args, options, theme as Theme);
+				this.registeredTool.definition.renderCall!(args, options, theme as Theme);
 		}
-		if (registeredTool.definition.renderResult) {
+		if (this.registeredTool.definition.renderResult) {
 			this.renderResult = (result: any, options: any, theme: any, args?: any) =>
-				registeredTool.definition.renderResult!(
+				this.registeredTool.definition.renderResult!(
 					result,
 					{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
 					theme as Theme,
@@ -193,10 +207,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;
 		const preResolved = resolveApproval(this.tool, approvalArgs(params, context), approvalMode, userPolicies);
 		if (preResolved.policy === "deny") {
-			throw new Error(
-				`Tool "${preResolved.policyKey ?? this.tool.name}" is blocked by user policy.\n` +
-					`To allow: remove "tools.approval.${preResolved.policyKey ?? this.tool.name}: deny" from config.`,
-			);
+			throw denyError(preResolved, this.tool.name);
 		}
 
 		// 1. Emit tool_call event first - extensions can block execution or revise the input the tool
@@ -246,10 +257,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
-			throw new Error(
-				`Tool "${resolved.policyKey ?? this.tool.name}" is blocked by user policy.\n` +
-					`To allow: remove "tools.approval.${resolved.policyKey ?? this.tool.name}: deny" from config.`,
-			);
+			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
 		// An xd:// device dispatch already cleared the write tool's outer gate at

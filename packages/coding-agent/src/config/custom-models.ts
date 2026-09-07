@@ -1,11 +1,11 @@
 import type { Api, Model, ModelSpec, RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getVariantAliasSources, resolveVariantSelector } from "@oh-my-pi/pi-catalog/compat/collapse";
 import {
 	getBundledModelReferenceIndex,
 	inheritReferenceThinking,
 	resolveModelReference,
 } from "@oh-my-pi/pi-catalog/identity";
-import { getVariantAliasSources, resolveVariantAlias } from "@oh-my-pi/pi-catalog/variant-collapse";
 import { logger } from "@oh-my-pi/pi-utils";
 import { createLiveConfigHeaders, type HeaderSource } from "./model-config-values";
 import { type ModelPatch, mergeCompat, mergeRemoteCompactionConfig } from "./model-patch";
@@ -78,6 +78,7 @@ export function buildCustomModelOverlay(
 	if (!api) return undefined;
 	return {
 		id: modelDef.id,
+		authRef: modelDef.authRef,
 		provider: providerName,
 		api,
 		baseUrl: modelDef.baseUrl ?? providerBaseUrl,
@@ -92,6 +93,7 @@ export function buildCustomModelOverlay(
 		contextWindow: modelDef.contextWindow,
 		maxTokens: modelDef.maxTokens,
 		omitMaxOutputTokens: modelDef.omitMaxOutputTokens,
+		preferWebsockets: modelDef.preferWebsockets,
 		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey),
 		compat: mergeCompat(providerCompat, modelDef.compat),
 		contextPromotionTarget: modelDef.contextPromotionTarget,
@@ -125,6 +127,7 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		name: resolvedModel.name ?? (options.useDefaults ? resolvedModel.id : undefined),
 		api: resolvedModel.api,
 		provider: resolvedModel.provider,
+		authRef: resolvedModel.authRef,
 		baseUrl: resolvedModel.baseUrl,
 		reasoning: resolvedModel.reasoning ?? reference?.reasoning ?? (options.useDefaults ? false : undefined),
 		thinking: inheritReferenceThinking(resolvedModel.thinking, reference, resolvedModel.provider),
@@ -132,10 +135,14 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		imageInputDecoder: resolvedModel.imageInputDecoder,
 		...(supportsTools !== undefined ? { supportsTools } : {}),
 		cost,
-		contextWindow: resolvedModel.contextWindow ?? reference?.contextWindow ?? (options.useDefaults ? 128000 : null),
+		contextWindow:
+			resolvedModel.contextWindow !== undefined
+				? resolvedModel.contextWindow
+				: (reference?.contextWindow ?? (options.useDefaults ? 128000 : null)),
 		maxTokens: resolvedModel.maxTokens ?? reference?.maxTokens ?? (options.useDefaults ? 16384 : null),
 		headers: resolvedModel.headers,
 		omitMaxOutputTokens: resolvedModel.omitMaxOutputTokens ?? reference?.omitMaxOutputTokens,
+		preferWebsockets: resolvedModel.preferWebsockets,
 		compat: mergeCompat(reference?.compatConfig, resolvedModel.compat),
 		tokenizer: resolvedModel.tokenizer,
 		contextPromotionTarget: resolvedModel.contextPromotionTarget,
@@ -160,7 +167,7 @@ export function normalizeSuppressedSelector(
 	if (!parsed) return trimmed;
 	// Retired effort-tier variant ids normalize to their collapsed logical id
 	// so persisted suppressions keyed by raw member ids still bind.
-	const aliasId = resolveVariantAlias(parsed.provider, parsed.id);
+	const aliasId = resolveVariantSelector(parsed.provider, parsed.id);
 	return `${parsed.provider}/${aliasId ?? parsed.id}`;
 }
 

@@ -13,10 +13,12 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AdvisorToolPools } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import * as advisorModule from "../src/advisor";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 describe("AgentSession advisor toggle", () => {
@@ -163,6 +165,90 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.formatAdvisorStatus()).toContain("Advisor is enabled (anthropic/claude-sonnet-4-5)");
 	});
 
+	it("builds two roster advisors with distinct role-specific system prompt baselines", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		expect(
+			await session.applyAdvisorConfigs(
+				[
+					{ name: "Task", role: "task" },
+					{ name: "Adversarial", role: "adversarial" },
+				],
+				undefined,
+			),
+		).toBe(0);
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		const task = session.getAdvisorAgent("Task");
+		const adversarial = session.getAdvisorAgent("Adversarial");
+		if (!task || !adversarial) throw new Error("Expected both named advisor agents to exist");
+		const taskPrompt = task.state.systemPrompt.join("\n");
+		const adversarialPrompt = adversarial.state.systemPrompt.join("\n");
+
+		expect(taskPrompt).toContain("User, code-quality, robustness advocate; peer-shadow main agent.");
+		expect(adversarialPrompt).toContain("Name the assumption you are attacking.");
+		expect(adversarialPrompt).toContain("Cite the evidence that makes it vulnerable.");
+		expect(adversarialPrompt).toContain("State the falsifier that would clear or reverse the concern.");
+		expect(taskPrompt).not.toBe(adversarialPrompt);
+	});
+
+	it("rebuilds the live advisor runtime and prompt when only its role changes", async () => {
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		expect(await session.applyAdvisorConfigs([{ name: "Review Seat", role: "task" }], undefined)).toBe(0);
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		const before = session.getAdvisorAgent("Review Seat");
+		if (!before) throw new Error("Expected the task advisor agent to exist");
+		const beforePrompt = before.state.systemPrompt.join("\n");
+		expect(beforePrompt).toContain("User, code-quality, robustness advocate; peer-shadow main agent.");
+
+		expect(await session.applyAdvisorConfigs([{ name: "Review Seat", role: "adversarial" }], undefined)).toBe(1);
+
+		const after = session.getAdvisorAgent("Review Seat");
+		if (!after) throw new Error("Expected the adversarial advisor agent to exist");
+		const afterPrompt = after.state.systemPrompt.join("\n");
+		expect(after).not.toBe(before);
+		expect(afterPrompt).not.toBe(beforePrompt);
+		expect(afterPrompt).toContain("Name the assumption you are attacking.");
+		expect(afterPrompt).toContain("Cite the evidence that makes it vulnerable.");
+		expect(afterPrompt).toContain("State the falsifier that would clear or reverse the concern.");
+	});
+
+	it("keeps the newest roster when tool-pool builds resolve out of order", async () => {
+		const first = Promise.withResolvers<AdvisorToolPools>();
+		const second = Promise.withResolvers<AdvisorToolPools>();
+		let buildCount = 0;
+		const customSettings = Settings.isolated({ "advisor.enabled": true });
+		customSettings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		const customSession = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: customSettings,
+			modelRegistry,
+			advisorTools: [],
+			advisorToolPoolBuilder: () => (buildCount++ === 0 ? first.promise : second.promise),
+		});
+		const emptyPools: AdvisorToolPools = {
+			toolsBySlug: new Map(),
+			createGrepToolBySlug: new Map(),
+			createEditToolBySlug: new Map(),
+		};
+		try {
+			const older = customSession.applyAdvisorConfigs([{ name: "Older" }], undefined);
+			const newer = customSession.applyAdvisorConfigs([{ name: "Newest" }], undefined);
+			second.resolve(emptyPools);
+			await newer;
+			first.resolve(emptyPools);
+			await older;
+
+			expect(customSession.getAdvisorAgent("Newest")).toBeDefined();
+			expect(customSession.getAdvisorAgent("Older")).toBeUndefined();
+		} finally {
+			await customSession.dispose();
+		}
+	});
+
 	it("explicit enable rebuilds the runtime when the advisor role changes", () => {
 		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -253,7 +339,7 @@ describe("AgentSession advisor toggle", () => {
 			expect(customSession.getAdvisorAgent()?.state.model.id).toBe(replacementModel.id);
 		} finally {
 			await customSession.dispose();
-			AgentStorage.resetInstance();
+			AgentStorage.close();
 		}
 	});
 
@@ -429,11 +515,47 @@ describe("AgentSession advisor toggle", () => {
 		session.setAdvisorEnabled(false);
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 	});
-	it("retains total advisor cost after the live roster changes", () => {
+	it("attributes advisor subscription spend after teardown without rescanning the catalog", () => {
+		// #10131: with the runtime gone, isUsingSubscription() must read the
+		// attribution captured as spend accrued, not fall back to a per-render
+		// getAvailable() catalog scan (which reads credential files per provider).
+		const oauthSpy = vi.spyOn(modelRegistry, "isUsingOAuth").mockReturnValue(true);
+		try {
+			const advisor = enableAdvisor();
+			appendAdvisorCost(advisor, 0.5, 1);
+			session.setAdvisorEnabled(false);
+			expect(session.isAdvisorActive()).toBe(false);
+			expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+
+			const scanSpy = vi.spyOn(modelRegistry, "getAvailable");
+			expect(session.isAdvisorUsingSubscription()).toBe(true);
+			expect(scanSpy).not.toHaveBeenCalled();
+			scanSpy.mockRestore();
+		} finally {
+			oauthSpy.mockRestore();
+		}
+	});
+	it("does not attribute paid spend to a subscription after a zero-cost OAuth turn", () => {
+		let usingOAuth = false;
+		const oauthSpy = vi.spyOn(modelRegistry, "isUsingOAuth").mockImplementation(() => usingOAuth);
+		try {
+			const advisor = enableAdvisor();
+			appendAdvisorCost(advisor, 0.5, 1);
+			usingOAuth = true;
+			appendAdvisorCost(advisor, 0, 2);
+			session.setAdvisorEnabled(false);
+
+			expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+			expect(session.isAdvisorUsingSubscription()).toBe(false);
+		} finally {
+			oauthSpy.mockRestore();
+		}
+	});
+	it("retains total advisor cost after the live roster changes", async () => {
 		const advisor = enableAdvisor();
 		appendAdvisorCost(advisor, 0.5, 1);
 
-		expect(session.applyAdvisorConfigs([{ name: "Security" }], undefined)).toBe(1);
+		expect(await session.applyAdvisorConfigs([{ name: "Security" }], undefined)).toBe(1);
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 		expect(session.formatAdvisorStatus()).toContain("$0.5000");
 	});
@@ -543,9 +665,105 @@ describe("AgentSession advisor toggle", () => {
 			enableLsp: false,
 		});
 		try {
+			// The scan runs off the critical path now (issue #9553), so await the
+			// backfill signal the session exposes rather than a wall-clock guess.
+			await result.session.advisorCostRestore;
 			expect(result.session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 		} finally {
 			await result.session.dispose();
+		}
+	});
+	it("seeds persisted advisor spend when no turn has been billed yet", () => {
+		enableAdvisor();
+		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+	});
+	it("attributes restored advisor spend to a subscription without a catalog scan", () => {
+		// #10131 follow-up: with no live runtime, subscription attribution comes
+		// from the providers that billed the restored spend, re-derived via the
+		// current OAuth credentials — never a per-render getAvailable() scan.
+		const oauthSpy = vi.spyOn(authStorage, "hasOAuth").mockImplementation(provider => provider === "anthropic");
+		const scanSpy = vi.spyOn(modelRegistry, "getAvailable");
+		try {
+			session.restoreInitialAdvisorCosts(new Map([["", 0.5]]), new Map(), new Map([["", new Set(["anthropic"])]]));
+			expect(session.isAdvisorActive()).toBe(false);
+			expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+			expect(session.isAdvisorUsingSubscription()).toBe(true);
+			expect(scanSpy).not.toHaveBeenCalled();
+		} finally {
+			scanSpy.mockRestore();
+			oauthSpy.mockRestore();
+		}
+	});
+	it("does not attribute restored advisor spend to a subscription without OAuth on its provider", () => {
+		const oauthSpy = vi.spyOn(authStorage, "hasOAuth").mockReturnValue(false);
+		try {
+			session.restoreInitialAdvisorCosts(new Map([["", 0.5]]), new Map(), new Map([["", new Set(["anthropic"])]]));
+			expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+			expect(session.isAdvisorUsingSubscription()).toBe(false);
+		} finally {
+			oauthSpy.mockRestore();
+		}
+	});
+	it("adds a turn billed while the resume scan is running to persisted spend", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		const events: string[] = [];
+		const unsubscribe = session.subscribe(event => events.push(event.type));
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation(async (_file, options) => {
+			await options?.beforeSnapshot;
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
+		try {
+			const advisor = enableAdvisor();
+			session.beginInitialAdvisorCostRestore();
+			appendAdvisorCost(advisor, 0.25, 1);
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBeCloseTo(0.75, 8);
+			expect(events).toContain("advisor_cost_changed");
+		} finally {
+			unsubscribe();
+			load.mockRestore();
+		}
+	});
+	it("cancels an initial cost restore when the session is disposed", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		let shouldContinue: (() => boolean) | undefined;
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation((_file, options) => {
+			shouldContinue = options?.shouldContinue;
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
+		try {
+			session.beginInitialAdvisorCostRestore();
+			expect(shouldContinue?.()).toBe(true);
+			session.beginDispose();
+			expect(shouldContinue?.()).toBe(false);
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBe(0);
+		} finally {
+			load.mockRestore();
+		}
+	});
+	it("ignores an initial cost restore after the active session changes", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation((_file, options) => {
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
+		try {
+			session.beginInitialAdvisorCostRestore();
+			await session.newSession();
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBe(0);
+		} finally {
+			load.mockRestore();
 		}
 	});
 	it("starts a new session with only post-transition advisor cost", async () => {

@@ -1,5 +1,5 @@
 Agent coordination: peer messaging, background-job control, and supervised long-running processes. Main agent is `Main`; subagents inherit task ID.
-Use `op: "list"` to discover peers. Address peers by exact roster ID — NEVER invent names.
+Use `op: "list"` to discover live peers. Default is running+idle plus running/idle/parked/shown/truncated counts — never an unbounded parked name dump. Pass `status: "parked"` for parked archaeology; optional `limit` bounds rows (default 32, max 100). Address peers by exact roster ID — NEVER invent names. `send` to a known parked id still revives it; `history://<id>` and `agent://<id>` stay readable.
 
 # Messaging & Jobs
 
@@ -17,6 +17,12 @@ Background jobs auto-deliver when they finish. You NEVER need to poll; if `jobs`
 - `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
 - NEVER use shell tools, grep, or read other sessions' files to figure out what a peer is doing. Message them directly.
 - NEVER use hub messaging for something a tool can answer (e.g., grepping codebase, running a build).
+
+# Prime external peers
+- IDs beginning with `prime://` target Prime daemon sessions. The encoded namespace keeps Prime session IDs distinct from local peer IDs.
+- `list` merges local peers with recently discovered Prime peers and deduplicates repeated Prime session IDs.
+- External `send` results include the verbatim Prime receipt in the result details. External `wait` returns the verbatim Prime message envelope.
+- External `inbox` is target-scoped and only consumes messages selected by the requested operation. A `wait` does not pre-drain the Prime inbox.
 
 # Processes
 

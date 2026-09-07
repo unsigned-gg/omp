@@ -5,6 +5,7 @@
  */
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { BridgeMessage, BridgeReceipt, ExternalPeer } from "@oh-my-pi/prime-bridge-protocol";
 import type { AsyncJobType } from "../../async";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
@@ -38,6 +39,21 @@ export interface HubPeerInfo {
 	unread: number;
 	lastActivity: number;
 	activity?: string;
+}
+
+/** Status values `op:"list"` can filter on. Advisor is a kind, not a status. */
+export type HubListStatus = "running" | "idle" | "parked";
+/** Model-facing roster bounds shared by the hub schema and executor. */
+export const DEFAULT_HUB_LIST_LIMIT = 32;
+export const MAX_HUB_LIST_LIMIT = 100;
+
+/** Addressable roster tallies always returned by `op:"list"`. */
+export interface HubRosterCounts {
+	running: number;
+	idle: number;
+	parked: number;
+	shown: number;
+	truncated: number;
 }
 
 /** Background-job row surfaced by `wait`/`cancel`/`jobs` results. */
@@ -93,14 +109,24 @@ export interface CoordinationDetails {
 	waited?: IrcMessage | null;
 	inbox?: IrcMessage[];
 	peers?: HubPeerInfo[];
+	/** Present on `op:"list"`: addressable running/idle/parked plus page size. */
+	counts?: HubRosterCounts;
 	jobs?: JobSnapshot[];
 	cancelled?: { id: string; status: CancelStatus }[];
 	/** Running subagents not represented by a job row in this result. */
+	/** Prime peers, kept separate from local AgentRegistry rows. */
+	externalPeers?: ExternalPeer[];
+	/** Verbatim receipts returned by the Prime bridge. */
+	externalReceipts?: BridgeReceipt[];
+	/** Verbatim messages returned by the Prime bridge inbox. */
+	externalInbox?: BridgeMessage[];
+	/** Message consumed by an external Prime wait. */
+	externalWaited?: BridgeMessage | null;
 	agents?: AgentActivitySnapshot[];
 }
 
 /** Hub result details: coordination snapshots or launch (process) state. */
-export type HubDetails = CoordinationDetails | LaunchToolDetails;
+export type HubDetails = (CoordinationDetails | LaunchToolDetails) & Partial<CoordinationDetails>;
 
 /** Partially-streamed hub call arguments, as seen by the renderers. */
 export type HubRenderArgs = {
