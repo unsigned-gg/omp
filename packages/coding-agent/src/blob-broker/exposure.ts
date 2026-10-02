@@ -10,7 +10,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, logger } from "@oh-my-pi/pi-utils";
+import { $which, getSafeProjectCwd, logger } from "@oh-my-pi/pi-utils";
 import { credentialString, type DestinationRuntimeConfig, optionString } from "./uploader-runtime";
 
 /** User-selectable exposure strategy. */
@@ -186,10 +186,13 @@ export async function probeExposureHealth(
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		healthUrl.searchParams.set("nonce", `${Date.now().toString(36)}-${attempt.toString(36)}`);
 		try {
-			const response = await fetchFn(healthUrl, {
+			// `cache` is absent from older undici RequestInit types; the
+			// intersection keeps this compiling against both old and new sets.
+			const init: RequestInit & { cache?: "no-store" } = {
 				cache: "no-store",
 				signal: AbortSignal.timeout(timeoutMs),
-			});
+			};
+			const response = await fetchFn(healthUrl, init);
 			if (response.status === 204) return;
 			finalStatus = `HTTP ${response.status}`;
 			try {
@@ -239,7 +242,7 @@ async function spawnUrlTunnel(
 	const fd = fs.openSync(logPath, "w");
 	let proc: Bun.Subprocess;
 	try {
-		proc = Bun.spawn(argv, { env: process.env, stdin: "ignore", stdout: fd, stderr: fd });
+		proc = Bun.spawn(argv, { env: process.env, stdin: "ignore", stdout: fd, stderr: fd, cwd: getSafeProjectCwd() });
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -248,6 +251,10 @@ async function spawnUrlTunnel(
 	let scanned = 0;
 	let baseUrl: string | undefined;
 	while (Date.now() < deadline) {
+		// Capture exit before reading: a process observed dead here cannot write
+		// after the read below, so that read sees its final output. Checking exit
+		// after the read races a fast tunnel that prints its URL and then exits.
+		const exitCode = proc.exitCode;
 		let text = "";
 		try {
 			text = await Bun.file(logPath).text();
@@ -271,8 +278,8 @@ async function spawnUrlTunnel(
 				return { proc, baseUrl };
 			}
 		}
-		if (proc.exitCode !== null) {
-			throw new Error(`${argv[0]} exited with code ${proc.exitCode} before reporting a tunnel URL`);
+		if (exitCode !== null) {
+			throw new Error(`${argv[0]} exited with code ${exitCode} before reporting a tunnel URL`);
 		}
 		await Bun.sleep(150);
 	}
@@ -497,7 +504,7 @@ export async function startExposure(config: ExposureConfig, port: number): Promi
 					`${remotePort}:127.0.0.1:${port}`,
 					config.sshTarget,
 				],
-				{ env: process.env, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+				{ env: process.env, stdin: "ignore", stdout: "ignore", stderr: "ignore", cwd: os.homedir() },
 			);
 			const early = await Promise.race([
 				proc.exited.then(code => code),

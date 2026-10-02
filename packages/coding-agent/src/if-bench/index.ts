@@ -1,7 +1,7 @@
 /**
  * `omp if-bench` — instruction-following and working-memory benchmark.
  *
- * One cacheable conversation per model: turn N issues N glyph opcodes over the
+ * One cacheable conversation per model: turn N issues N glyph actions over the
  * array the model itself reported last turn, while a `nya{1,N}` directive
  * rotates through the start, middle, and end of the prompt. A model's score is
  * the depth it reaches before it either loses the array or drops the cat sound,
@@ -15,9 +15,9 @@ import {
 	resolveBenchTargets,
 	type StreamSimpleFn,
 } from "../cli/bench-runtime";
-import type { LiveBoardOutput } from "../cli/live-board";
+import type { LiveBoardOutput } from "@oh-my-pi/pi-tui/chrome/live-board";
 import { initialArray } from "./actions";
-import { createIfBenchBoard, formatIfBenchScoreboard } from "./board";
+import { createIfBenchBoard, formatIfBenchScoreboard } from "@oh-my-pi/pi-tui/apps/if-bench-board";
 import { DEFAULT_NYA_MAX } from "./protocol";
 import { type IfBenchSummary, runIfBench } from "./runner";
 
@@ -43,6 +43,7 @@ export interface IfBenchDependencies {
 	streamSimple?: StreamSimpleFn;
 	now?: () => number;
 	randomSessionId?: () => string;
+	sleep?: (ms: number) => Promise<void>;
 	writeStdout?: (text: string) => void;
 	writeStderr?: (text: string) => void;
 	setExitCode?: (code: number) => void;
@@ -105,7 +106,7 @@ export async function runIfBenchCommand(
 
 	const runtime = await (deps.createRuntime ?? createDefaultBenchRuntime)();
 	try {
-		const targets = resolveBenchTargets(command.models, runtime.modelRegistry, runtime.settings, writeStderr);
+		const targets = await resolveBenchTargets(command.models, runtime.modelRegistry, runtime.settings, writeStderr);
 		board?.log(
 			chalk.dim(
 				`if-bench · ${targets.length} model${targets.length === 1 ? "" : "s"} · up to ${maxTurns} turns · array ${arrayLength} · nya{1,${nyaMax}} · temperature 0`,
@@ -122,6 +123,7 @@ export async function runIfBenchCommand(
 			stream: deps.streamSimple ?? streamSimple,
 			now: deps.now ?? (() => performance.now()),
 			randomSessionId: deps.randomSessionId ?? (() => Bun.randomUUIDv7()),
+			sleep: deps.sleep,
 			observer: board,
 		});
 		board?.close();
